@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+release/
+.vite/
+
+# Pack / portable outputs
+pack-*.zip
+pack-*.enc
+
+# Local data & servers (không phải source)
+Nhac/
+server-ban-key/
+web-ban-key/
+auth-server-tiengcuoi-dong/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Editor / IDE
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Test / coverage
+coverage/
+
+# Misc
+*.local
+electron-vite.config.*.local
