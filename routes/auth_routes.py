@@ -54,20 +54,24 @@ def register():
 @auth_bp.route('/login', methods=['POST'])
 def login():
     data = request.get_json() or {}
-    email = data.get('email', '').strip().lower()
+    email_or_name = data.get('email', '').strip().lower()
     password = data.get('password', '')
 
-    if not email or not password:
-        return jsonify({'error': 'Email và mật khẩu là bắt buộc'}), 400
+    if not email_or_name or not password:
+        return jsonify({'error': 'Tên đăng nhập/email và mật khẩu là bắt buộc'}), 400
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('SELECT * FROM users WHERE LOWER(email) = %s', (email,))
+    # Tìm theo email hoặc name (không phân biệt hoa thường)
+    cur.execute(
+        'SELECT * FROM users WHERE LOWER(email) = %s OR LOWER(name) = %s',
+        (email_or_name, email_or_name)
+    )
     row = cur.fetchone()
 
     if not row:
-        print(f"[LOGIN] ❌ Không tìm thấy user: '{email}'")
-        return jsonify({'error': 'Email hoặc mật khẩu không đúng'}), 401
+        print(f"[LOGIN] ❌ Không tìm thấy user: '{email_or_name}'")
+        return jsonify({'error': 'Tên đăng nhập/email hoặc mật khẩu không đúng'}), 401
 
     pw_stored = row['password']
     if isinstance(pw_stored, str):
@@ -77,10 +81,10 @@ def login():
 
     pwd_bytes = password.encode('utf-8')
     match = bcrypt.checkpw(pwd_bytes, pw_stored)
-    print(f"[LOGIN] email_client='{email}' | email_db='{row['email']}' | hash='{row['password'][:30]}...' | bcrypt_match={match}")
+    print(f"[LOGIN] identifier='{email_or_name}' | email_db='{row['email']}' | name_db='{row['name']}' | hash='{row['password'][:30]}...' | bcrypt_match={match}")
 
     if not match:
-        return jsonify({'error': 'Email hoặc mật khẩu không đúng'}), 401
+        return jsonify({'error': 'Tên đăng nhập/email hoặc mật khẩu không đúng'}), 401
 
     user = {'id': row['id'], 'email': row['email'], 'name': row['name'], 'role': row['role']}
     access_token, refresh_token = generate_tokens(row['id'], row['email'], row['role'])
@@ -155,10 +159,66 @@ def get_me():
     return jsonify(dict(row))
 
 
+@auth_bp.route('/change-password', methods=['POST'])
+@require_auth
+def change_password():
+    """Đổi mật khẩu: yêu cầu mật khẩu cũ để xác nhận."""
+    data = request.get_json() or {}
+    current_password = data.get('currentPassword', '')
+    new_password = data.get('newPassword', '')
+
+    if not current_password or not new_password:
+        return jsonify({'error': 'Mật khẩu hiện tại và mật khẩu mới là bắt buộc'}), 400
+
+    if len(new_password) < 6:
+        return jsonify({'error': 'Mật khẩu mới phải có ít nhất 6 ký tự'}), 400
+
+    if current_password == new_password:
+        return jsonify({'error': 'Mật khẩu mới phải khác mật khẩu hiện tại'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT password FROM users WHERE id = %s', (request.user['id'],))
+    row = cur.fetchone()
+
+    if not row:
+        return jsonify({'error': 'Không tìm thấy người dùng'}), 404
+
+    pw_stored = row['password']
+    # User đăng ký Google — không có password
+    if not pw_stored:
+        return jsonify({'error': 'Tài khoản này không sử dụng mật khẩu (đăng nhập qua Google)'}), 400
+
+    if isinstance(pw_stored, str):
+        pw_stored = pw_stored.encode('utf-8')
+    elif isinstance(pw_stored, (bytes, bytearray, memoryview)):
+        pw_stored = bytes(pw_stored)
+
+    if not bcrypt.checkpw(current_password.encode('utf-8'), pw_stored):
+        return jsonify({'error': 'Mật khẩu hiện tại không đúng'}), 401
+
+    new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    cur.execute('UPDATE users SET password = %s WHERE id = %s', (new_hash, request.user['id']))
+    conn.commit()
+
+    return jsonify({'message': 'Đổi mật khẩu thành công'})
+
+
 # ─── Google OAuth ──────────────────────────────────────────────────────────────
 
+def _request_origin():
+    # Flask host_url luôn có dấu '/' cuối
+    return request.host_url.rstrip('/')
+
+
 def _frontend_url():
-    return current_app.config.get('FRONTEND_URL', 'http://localhost:5173')
+    # Ưu tiên FRONTEND_URL khi đã cấu hình rõ ràng
+    frontend = (current_app.config.get('FRONTEND_URL') or '').strip()
+    if frontend:
+        return frontend.rstrip('/')
+
+    # Fallback: cùng origin với request hiện tại (hữu ích khi chạy theo IP/domain server)
+    return _request_origin()
 
 
 def _google_redirect(frontend_path, use_callback_page=True):
@@ -174,6 +234,15 @@ def _google_redirect(frontend_path, use_callback_page=True):
     return f'{base}{separator}{frontend_path}'
 
 
+def _google_redirect_uri():
+    configured = (current_app.config.get('GOOGLE_REDIRECT_URI') or '').strip()
+    if configured:
+        return configured
+
+    # Fallback động theo host hiện tại của backend
+    return f"{_request_origin()}/api/auth/google/callback"
+
+
 @auth_bp.route('/google', methods=['GET'])
 def google_auth_start():
     """
@@ -181,7 +250,7 @@ def google_auth_start():
     Sau khi user đồng ý, Google redirect về /api/auth/google/callback với code.
     """
     client_id = current_app.config.get('GOOGLE_CLIENT_ID')
-    redirect_uri = current_app.config.get('GOOGLE_REDIRECT_URI', 'http://localhost:3001/api/auth/google/callback')
+    redirect_uri = _google_redirect_uri()
 
     if not client_id:
         # Không có credentials → redirect về frontend với thông báo lỗi
@@ -215,7 +284,7 @@ def google_auth_callback():
 
     client_id = current_app.config.get('GOOGLE_CLIENT_ID')
     client_secret = current_app.config.get('GOOGLE_CLIENT_SECRET')
-    redirect_uri = current_app.config.get('GOOGLE_REDIRECT_URI', 'http://localhost:3001/api/auth/google/callback')
+    redirect_uri = _google_redirect_uri()
 
     # Đổi authorization code lấy access token từ Google
     try:

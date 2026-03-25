@@ -1,8 +1,23 @@
 from flask import Blueprint, request, jsonify
 import uuid
 import json
+from datetime import datetime, timedelta, timezone
 from db import get_db
 from auth import require_auth
+
+PAYMENT_EXPIRE_MINUTES = 30
+
+def _cancel_expired_pending_orders() -> int:
+    conn = get_db()
+    cur = conn.cursor()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=PAYMENT_EXPIRE_MINUTES)
+    cur.execute(
+        "UPDATE orders SET status = 'cancelled', updated_at = NOW() "
+        "WHERE status = 'pending' AND created_at < %s",
+        (cutoff,)
+    )
+    conn.commit()
+    return cur.rowcount
 
 payments_bp = Blueprint('payments', __name__)
 
@@ -32,7 +47,7 @@ def create_payment_order():
 
     payment_id = f"PAY{uuid.uuid4().hex[:10].upper()}"
     order_id = f"DH{uuid.uuid4().hex[:10].upper()}"
-    license_key = generate_license_key(product_id[:2].upper())
+    # Chưa tạo license_key ở đây — sẽ tạo khi thanh toán thành công
 
     snapshot = {
         'name': product['name'],
@@ -42,9 +57,9 @@ def create_payment_order():
 
     cur.execute("""
         INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, status, payment_method, payment_id, license_key)
-        VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, NULL)
     """, (order_id, request.user['id'], product_id, json.dumps(snapshot),
-          product['price'], payment_method, payment_id, license_key))
+          product['price'], payment_method, payment_id))
     conn.commit()
 
     payment_info = {
@@ -104,7 +119,15 @@ def payment_callback():
         return jsonify({'error': 'Đơn hàng không tồn tại'}), 404
 
     new_status = 'completed' if status in ('success', 'completed') else 'cancelled'
-    cur.execute('UPDATE orders SET status = %s, updated_at = NOW() WHERE id = %s', (new_status, order_id))
+
+    if new_status == 'completed':
+        license_key = generate_license_key(order['product_id'][:2].upper())
+        cur.execute(
+            'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
+            (new_status, license_key, order_id)
+        )
+    else:
+        cur.execute('UPDATE orders SET status = %s, updated_at = NOW() WHERE id = %s', (new_status, order_id))
     conn.commit()
 
     return jsonify({'success': True})
@@ -119,6 +142,7 @@ def confirm_payment():
     if not order_id:
         return jsonify({'error': 'orderId là bắt buộc'}), 400
 
+    _cancel_expired_pending_orders()
     conn = get_db()
     cur = conn.cursor()
     cur.execute('SELECT * FROM orders WHERE id = %s AND user_id = %s', (order_id, request.user['id']))
@@ -136,21 +160,23 @@ def confirm_payment():
     except Exception:
         snapshot = {}
 
-    cur.execute('UPDATE orders SET status = %s, updated_at = NOW() WHERE id = %s', ('completed', order_id))
+    license_key = generate_license_key(order['product_id'][:2].upper())
+    cur.execute(
+        'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
+        ('completed', license_key, order_id)
+    )
     conn.commit()
-
-    cur.execute('SELECT * FROM orders WHERE id = %s', (order_id,))
-    updated = cur.fetchone()
 
     return jsonify({
         'success': True,
+        'licenseKey': license_key,
         'order': {
-            'id': updated['id'],
+            'id': order_id,
             'product': snapshot.get('name', ''),
-            'date': updated['created_at'],
-            'price': updated['total_price'],
-            'status': updated['status'],
-            'key': updated['license_key'],
+            'date': order['created_at'],
+            'price': order['total_price'],
+            'status': 'completed',
+            'key': license_key,
         },
     })
 

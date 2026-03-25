@@ -57,32 +57,42 @@ def save_session(user_id: str, token: str, hours: int):
     cur.close()
 
 
+def _decode_token(token: str):
+    """Decode JWT và kiểm tra session. Trả về payload dict hoặc None."""
+    try:
+        payload = jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        'SELECT * FROM sessions WHERE user_id = %s AND token_hash = %s AND expires_at > NOW()',
+        (payload['userId'], hash_token(token)),
+    )
+    session = cur.fetchone()
+    cur.close()
+    return payload if session else None
+
+
 def require_auth(f):
-    """Decorator: yêu cầu Bearer token hợp lệ, đặt request.user dict."""
+    """Decorator: yêu cầu Bearer token hợp lệ, đặt request.user dict.
+    Chấp nhận token từ header 'Authorization: Bearer <token>' HOẶC query param '?token=<token>'
+    (dùng cho <audio> tag không gửi được custom headers)."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.headers.get('Authorization', '')
-        if not auth.startswith('Bearer '):
+        token = None
+        if auth.startswith('Bearer '):
+            token = auth[7:]
+        elif request.args.get('token'):
+            token = request.args.get('token')
+
+        if not token:
             return jsonify({'error': 'No token provided'}), 401
 
-        token = auth[7:]
-        try:
-            payload = jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Invalid token'}), 401
-
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            'SELECT * FROM sessions WHERE user_id = %s AND token_hash = %s AND expires_at > NOW()',
-            (payload['userId'], hash_token(token)),
-        )
-        session = cur.fetchone()
-        cur.close()
-        if not session:
-            return jsonify({'error': 'Token has been revoked'}), 401
+        payload = _decode_token(token)
+        if not payload:
+            return jsonify({'error': 'Token invalid or revoked'}), 401
 
         # request.user là dict — KHÔNG dùng getattr(obj, 'attr') vì dict không có attribute
         request.user = {

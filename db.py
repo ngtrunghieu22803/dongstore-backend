@@ -67,6 +67,10 @@ def init_db():
             video_url TEXT,
             stock INTEGER DEFAULT -1,
             is_active INTEGER DEFAULT 1,
+            content TEXT,
+            images TEXT,
+            install_guide TEXT,
+            screenshots TEXT,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
         """
@@ -75,9 +79,32 @@ def init_db():
     for col_sql in [
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS image TEXT",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS video_url TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS content TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS images TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS install_guide TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS screenshots TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS preview_audio TEXT",
     ]:
         cur.execute(col_sql)
-    
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sounds (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT DEFAULT 'Sounds',
+            description TEXT,
+            object_name TEXT NOT NULL,
+            original_filename TEXT,
+            file_size INTEGER,
+            duration_seconds INTEGER,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute("ALTER TABLE sounds ADD COLUMN IF NOT EXISTS storage TEXT DEFAULT 'minio'")
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
@@ -106,6 +133,37 @@ def init_db():
         )
         """
     )
+
+    # Wallets - mỗi user có 1 ví
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+            balance INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+    # Deposit requests - lịch sử nạp tiền
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS deposits (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            amount INTEGER NOT NULL,
+            transfer_content TEXT NOT NULL,
+            bank_name TEXT,
+            account_number TEXT,
+            account_name TEXT,
+            qr_url TEXT,
+            status TEXT DEFAULT 'pending',
+            vietqr_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            confirmed_at TIMESTAMPTZ,
+            cancelled_at TIMESTAMPTZ
+        )
+    """)
+
     conn.commit()
 
     cur.execute("SELECT COUNT(*) AS c FROM products")
