@@ -7,8 +7,39 @@ from flask import Blueprint, request, jsonify
 from db import get_db
 from auth import require_auth
 import upload
+import onedrive_graph
+from routes.orders import is_sound_product, generate_license_key as gen_order_license_key
 
 admin_bp = Blueprint('admin', __name__)
+
+# Trùng với routes.orders.SOUND_STORE_CATEGORY — dùng cho INSERT products từ sounds
+SOUND_STORE_CATEGORY = 'Âm thanh'
+
+
+def _upsert_store_product_for_sound(cur, sound_row: dict):
+    """Âm thanh trả phí và đang bật → một dòng products (id = sound id) để user checkout."""
+    sid = sound_row['id']
+    price = int(sound_row.get('price') or 0)
+    active = int(sound_row.get('is_active', 1))
+    if price <= 0 or not active:
+        cur.execute('DELETE FROM products WHERE id = %s', (sid,))
+        return
+    name = sound_row['name']
+    desc = sound_row.get('description') or ''
+    cur.execute(
+        """
+        INSERT INTO products (id, name, category, price, description, features, stock, is_active, require_duration, emoji)
+        VALUES (%s, %s, %s, %s, %s, '[]', -1, %s, 0, '🎵')
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            category = EXCLUDED.category,
+            price = EXCLUDED.price,
+            description = COALESCE(EXCLUDED.description, products.description),
+            is_active = EXCLUDED.is_active,
+            require_duration = 0
+        """,
+        (sid, name, SOUND_STORE_CATEGORY, price, desc, 1 if active else 0),
+    )
 
 
 def _require_admin(f):
@@ -48,6 +79,19 @@ def list_products():
             p['installGuide'] = p['install_guide']
         if 'preview_audio' in p:
             p['previewAudio'] = p['preview_audio']
+        if 'app_download_url' in p:
+            p['appDownloadUrl'] = p['app_download_url'] or ''
+        if 'app_installer_path' in p:
+            p['appInstallerPath'] = p['app_installer_path'] or ''
+        try:
+            p['duration_options'] = json.loads(p['duration_options']) if p.get('duration_options') else []
+        except Exception:
+            p['duration_options'] = []
+        try:
+            p['duration_prices'] = json.loads(p['duration_prices']) if p.get('duration_prices') else {}
+        except Exception:
+            p['duration_prices'] = {}
+        p['require_duration'] = bool(p.get('require_duration'))
         products.append(p)
 
     return jsonify({'products': products})
@@ -74,6 +118,27 @@ def create_product():
     images = data.get('images', [])
     install_guide = data.get('installGuide', '').strip() or None
     screenshots = data.get('screenshots', [])
+    preview_audio = data.get('previewAudio', '').strip() or None
+    duration_options = data.get('duration_options', [])
+    if not isinstance(duration_options, list):
+        duration_options = []
+    duration_options = [str(x).strip() for x in duration_options if str(x).strip()]
+    duration_prices = data.get('duration_prices', {})
+    if not isinstance(duration_prices, dict):
+        duration_prices = {}
+    normalized_prices = {}
+    for k, v in duration_prices.items():
+        key = str(k).strip()
+        try:
+            normalized_prices[key] = int(v)
+        except Exception:
+            continue
+    require_duration = 1 if data.get('require_duration', False) else 0
+    app_download_url = data.get('appDownloadUrl') or data.get('app_download_url') or ''
+    if isinstance(app_download_url, str):
+        app_download_url = app_download_url.strip() or None
+    else:
+        app_download_url = None
 
     if not name or not category or price <= 0:
         return jsonify({'error': 'name, category, price là bắt buộc'}), 400
@@ -85,8 +150,8 @@ def create_product():
     try:
         cur.execute(
             """
-            INSERT INTO products (id, name, category, price, original_price, badge, emoji, description, features, image, video_url, stock, is_active, content, images, install_guide, screenshots)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO products (id, name, category, price, original_price, badge, emoji, description, features, image, video_url, stock, is_active, content, images, install_guide, screenshots, preview_audio, duration_options, duration_prices, require_duration, app_download_url, app_installer_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 product_id,
@@ -106,6 +171,12 @@ def create_product():
                 json.dumps(images, ensure_ascii=False) if isinstance(images, list) else images,
                 install_guide,
                 json.dumps(screenshots, ensure_ascii=False) if isinstance(screenshots, list) else screenshots,
+                preview_audio,
+                json.dumps(duration_options, ensure_ascii=False),
+                json.dumps(normalized_prices, ensure_ascii=False),
+                require_duration,
+                app_download_url,
+                None,
             ),
         )
         conn.commit()
@@ -138,6 +209,19 @@ def get_product(product_id):
         p['installGuide'] = p['install_guide']
     if 'preview_audio' in p:
         p['previewAudio'] = p['preview_audio']
+    if 'app_download_url' in p:
+        p['appDownloadUrl'] = p['app_download_url'] or ''
+    if 'app_installer_path' in p:
+        p['appInstallerPath'] = p['app_installer_path'] or ''
+    try:
+        p['duration_options'] = json.loads(p['duration_options']) if p.get('duration_options') else []
+    except Exception:
+        p['duration_options'] = []
+    try:
+        p['duration_prices'] = json.loads(p['duration_prices']) if p.get('duration_prices') else {}
+    except Exception:
+        p['duration_prices'] = {}
+    p['require_duration'] = bool(p.get('require_duration'))
     return jsonify(p)
 
 
@@ -156,16 +240,32 @@ def update_product(product_id):
     updates = []
     params = []
 
-    for field in ['name', 'category', 'price', 'original_price', 'badge', 'emoji', 'description', 'image', 'video_url', 'stock', 'is_active', 'content', 'images', 'screenshots', 'features', 'preview_audio']:
+    for field in ['name', 'category', 'price', 'original_price', 'badge', 'emoji', 'description', 'image', 'video_url', 'stock', 'is_active', 'content', 'images', 'screenshots', 'features', 'preview_audio', 'duration_options', 'duration_prices', 'require_duration']:
         if field in data:
             val = data[field]
             if field in ('price', 'original_price', 'stock'):
                 val = int(val) if val else 0
             elif field == 'is_active':
                 val = 1 if val else 0
-            elif field in ('features', 'images', 'screenshots'):
+            elif field in ('features', 'images', 'screenshots', 'duration_options'):
                 val = json.dumps(val, ensure_ascii=False) if isinstance(val, list) else val
+            elif field == 'duration_prices':
+                if isinstance(val, dict):
+                    normalized_prices = {}
+                    for k, v in val.items():
+                        key = str(k).strip()
+                        try:
+                            normalized_prices[key] = int(v)
+                        except Exception:
+                            continue
+                    val = json.dumps(normalized_prices, ensure_ascii=False)
+                else:
+                    val = json.dumps({}, ensure_ascii=False)
+            elif field == 'require_duration':
+                val = 1 if val else 0
             elif field == 'install_guide':
+                continue
+            elif field == 'preview_audio':
                 continue
             elif isinstance(val, str):
                 val = val.strip() or None
@@ -182,6 +282,12 @@ def update_product(product_id):
     if 'previewAudio' in data:
         val = data['previewAudio']
         updates.append('preview_audio = %s')
+        params.append(val if val else None)
+    # Link tải app (OneDrive / URL) — chỉ lộ cho user qua /orders
+    if 'appDownloadUrl' in data:
+        val = data['appDownloadUrl']
+        val = val.strip() if isinstance(val, str) else ''
+        updates.append('app_download_url = %s')
         params.append(val if val else None)
 
     if not updates:
@@ -300,8 +406,60 @@ def update_order_status(order_id):
     order_row = cur.fetchone()
 
     if new_status in ('completed', 'paid') and not order_row['license_key']:
-        from orders import generate_license_key
-        license_key = generate_license_key(order_row['product_id'][:2].upper())
+        cur.execute('SELECT * FROM products WHERE id = %s', (order_row['product_id'],))
+        prod_row = cur.fetchone()
+        if prod_row and is_sound_product(prod_row):
+            cur.execute(
+                'UPDATE orders SET status = %s, license_key = NULL, updated_at = NOW() WHERE id = %s',
+                (new_status, order_id),
+            )
+            conn.commit()
+            return jsonify({'success': True, 'id': order_id, 'status': new_status, 'licenseKey': None, 'isSoundOrder': True})
+
+        # Nếu là đơn gia hạn (snapshot có renew_key) thì dùng lại key cũ và cộng dồn thời hạn
+        cur.execute('SELECT product_snapshot, user_id, product_id FROM orders WHERE id = %s', (order_id,))
+        full_order = cur.fetchone()
+        snapshot = {}
+        try:
+            snapshot = json.loads(full_order['product_snapshot']) if full_order and full_order.get('product_snapshot') else {}
+        except Exception:
+            snapshot = {}
+
+        renew_key = (snapshot.get('renew_key') or '').strip() if isinstance(snapshot, dict) else ''
+        duration_code = snapshot.get('duration_code') if isinstance(snapshot, dict) else None
+
+        if renew_key:
+            cur.execute('SELECT require_duration FROM products WHERE id = %s', (full_order['product_id'],))
+            adm_prod = cur.fetchone()
+            if not adm_prod or not bool(adm_prod.get('require_duration')):
+                return jsonify({'error': 'Sản phẩm này không hỗ trợ gia hạn'}), 400
+            cur.execute('SELECT license_key, user_id, product_id, expires_at, status FROM licenses WHERE license_key = %s', (renew_key,))
+            lk = cur.fetchone()
+            if not lk:
+                return jsonify({'error': 'Key gia hạn không tồn tại'}), 400
+            if lk.get('user_id') != full_order['user_id'] or lk.get('product_id') != full_order['product_id']:
+                return jsonify({'error': 'Key gia hạn không hợp lệ'}), 400
+            if (lk.get('status') or 'active') != 'active':
+                return jsonify({'error': 'Key đã bị vô hiệu hóa, không thể gia hạn'}), 400
+
+            days_map = {'3_days': 3, '1_month': 30, '3_months': 90, '1_year': 365}
+            days = days_map.get(str(duration_code or '').strip(), 0)
+            from datetime import datetime, timezone, timedelta
+            base = lk['expires_at'] if lk.get('expires_at') and lk['expires_at'] > datetime.now(timezone.utc) else datetime.now(timezone.utc)
+            new_expires = base + timedelta(days=days) if days > 0 else lk.get('expires_at')
+
+            cur.execute(
+                "UPDATE licenses SET expires_at = %s, status = 'active', activated_at = NOW(), last_check_at = NOW() WHERE license_key = %s",
+                (new_expires, renew_key),
+            )
+            cur.execute(
+                'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
+                (new_status, renew_key, order_id)
+            )
+            conn.commit()
+            return jsonify({'success': True, 'id': order_id, 'status': new_status, 'licenseKey': renew_key})
+
+        license_key = gen_order_license_key(order_row['product_id'])
         cur.execute(
             'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
             (new_status, license_key, order_id)
@@ -465,6 +623,91 @@ def delete_product_preview(product_id: str):
         return jsonify({'error': f'Xóa thất bại: {str(e)}'}), 500
 
 
+_APP_INSTALLER_EXT = frozenset(
+    {'zip', 'exe', 'msi', 'dmg', 'apk', 'rar', '7z', 'tar', 'gz', 'bin'}
+)
+_APP_INSTALLER_MAX = 250 * 1024 * 1024
+
+
+@admin_bp.route('/products/<product_id>/app-installer', methods=['POST'])
+@_require_admin
+def upload_product_app_installer(product_id: str):
+    """Upload file cài app lên OneDrive (DongStore_sounds/phanmem hoặc ONEDRIVE_APP_INSTALLER_FOLDER)."""
+    if not onedrive_graph.onedrive_configured():
+        return jsonify({'error': 'Chưa cấu hình Microsoft Graph / OneDrive (MS_GRAPH_*)'}), 400
+    if 'file' not in request.files:
+        return jsonify({'error': 'Không có file'}), 400
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'Chưa chọn file'}), 400
+    ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
+    if ext not in _APP_INSTALLER_EXT:
+        return jsonify({'error': f'Định dạng không hỗ trợ: .{ext}'}), 400
+    data = file.read()
+    if len(data) > _APP_INSTALLER_MAX:
+        return jsonify({'error': 'File quá lớn (tối đa 250MB)'}), 400
+    content_type = (file.content_type or '').strip() or 'application/octet-stream'
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT id, app_installer_path FROM products WHERE id = %s', (product_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Sản phẩm không tồn tại'}), 404
+    old_path = row.get('app_installer_path') if isinstance(row, dict) else row[1]
+
+    try:
+        new_path = onedrive_graph.upload_product_app_installer(
+            product_id, file.filename, data, content_type
+        )
+    except Exception as e:
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+
+    if old_path:
+        try:
+            onedrive_graph.delete_product_app_installer(old_path)
+        except Exception:
+            pass
+
+    cur.execute(
+        'UPDATE products SET app_installer_path = %s, app_download_url = NULL WHERE id = %s',
+        (new_path, product_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True, 'appInstallerPath': new_path})
+
+
+@admin_bp.route('/products/<product_id>/app-installer', methods=['DELETE'])
+@_require_admin
+def delete_product_app_installer_admin(product_id: str):
+    """Xóa file app trên OneDrive và trong DB."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT id, app_installer_path FROM products WHERE id = %s', (product_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Sản phẩm không tồn tại'}), 404
+    path = row.get('app_installer_path') if isinstance(row, dict) else row[1]
+    if path:
+        try:
+            onedrive_graph.delete_product_app_installer(path)
+        except Exception:
+            pass
+    cur.execute('UPDATE products SET app_installer_path = NULL WHERE id = %s', (product_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
+
+
 # ─── Sounds ─────────────────────────────────────────────────────────────────
 
 @admin_bp.route('/sounds', methods=['GET'])
@@ -499,6 +742,8 @@ def create_sound():
     category = request.form.get('category', 'Sounds').strip() or 'Sounds'
     description = request.form.get('description', '').strip() or None
     duration_seconds = request.form.get('duration_seconds')
+    price = request.form.get('price', '0').strip()
+    price_value = int(price) if price.isdigit() else 0
 
     if not name:
         return jsonify({'error': 'Tên âm thanh là bắt buộc'}), 400
@@ -513,8 +758,8 @@ def create_sound():
 
         cur.execute(
             """
-            INSERT INTO sounds (id, name, category, description, object_name, original_filename, file_size, duration_seconds, storage)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO sounds (id, name, category, description, object_name, original_filename, file_size, duration_seconds, storage, price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 category = EXCLUDED.category,
@@ -523,7 +768,8 @@ def create_sound():
                 original_filename = EXCLUDED.original_filename,
                 file_size = EXCLUDED.file_size,
                 duration_seconds = EXCLUDED.duration_seconds,
-                storage = EXCLUDED.storage
+                storage = EXCLUDED.storage,
+                price = EXCLUDED.price
             """,
             (
                 sound_id,
@@ -535,12 +781,15 @@ def create_sound():
                 result['size'],
                 int(duration_seconds) if duration_seconds else None,
                 result.get('storage', 'minio'),
+                price_value,
             ),
         )
         conn.commit()
 
         cur.execute('SELECT * FROM sounds WHERE id = %s', (sound_id,))
         row = dict(cur.fetchone())
+        _upsert_store_product_for_sound(cur, row)
+        conn.commit()
         row['isActive'] = bool(row.get('is_active', 1))
         if row.get('created_at'):
             row['createdAt'] = row['created_at'].isoformat() if hasattr(row['created_at'], 'isoformat') else str(row['created_at'])
@@ -572,13 +821,15 @@ def update_sound(sound_id):
 
     updates = []
     params = []
-    for field in ['name', 'category', 'description', 'is_active', 'duration_seconds']:
+    for field in ['name', 'category', 'description', 'is_active', 'duration_seconds', 'price']:
         if field in data:
             val = data[field]
             if field == 'is_active':
                 val = 1 if val else 0
             elif isinstance(val, str):
                 val = val.strip() or None
+            elif field == 'price':
+                val = int(val) if val and str(val).isdigit() else 0
             updates.append(f'{field} = %s')
             params.append(val)
 
@@ -591,6 +842,8 @@ def update_sound(sound_id):
 
     cur.execute('SELECT * FROM sounds WHERE id = %s', (sound_id,))
     row = dict(cur.fetchone())
+    _upsert_store_product_for_sound(cur, row)
+    conn.commit()
     row['isActive'] = bool(row.get('is_active', 1))
     if row.get('created_at'):
         row['createdAt'] = row['created_at'].isoformat() if hasattr(row['created_at'], 'isoformat') else str(row['created_at'])
@@ -618,6 +871,11 @@ def delete_sound(sound_id):
     except Exception:
         pass
 
+    cur.execute('SELECT 1 FROM orders WHERE product_id = %s LIMIT 1', (sound_id,))
+    if cur.fetchone():
+        cur.execute("UPDATE products SET is_active = 0 WHERE id = %s", (sound_id,))
+    else:
+        cur.execute('DELETE FROM products WHERE id = %s', (sound_id,))
     cur.execute('DELETE FROM sounds WHERE id = %s', (sound_id,))
     conn.commit()
     cur.close()
@@ -674,6 +932,124 @@ def sound_direct_url(sound_id):
 
 
 # ─── Deposit Management ─────────────────────────────────────────────────────────
+
+@admin_bp.route('/licenses', methods=['GET'])
+@_require_admin
+def list_licenses():
+    """Danh sách license key cho admin quản lý."""
+    status = (request.args.get('status') or '').strip().lower()
+    q = (request.args.get('q') or '').strip()
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)
+    per_page = min(max(per_page, 1), 200)
+    offset = (page - 1) * per_page
+
+    where = []
+    params = []
+    if status:
+      where.append('l.status = %s')
+      params.append(status)
+    if q:
+      like = f"%{q}%"
+      where.append('(l.license_key ILIKE %s OR COALESCE(u.email, \'\') ILIKE %s OR COALESCE(p.name, \'\') ILIKE %s)')
+      params.extend([like, like, like])
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ''
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT COUNT(*) AS c FROM licenses l LEFT JOIN users u ON l.user_id = u.id LEFT JOIN products p ON l.product_id = p.id {where_sql}",
+        params,
+    )
+    row = cur.fetchone()
+    total = row['c'] if isinstance(row, dict) else row[0]
+
+    cur.execute(
+        f"""
+        SELECT l.*, u.email AS user_email, u.name AS user_name, p.name AS product_name
+        FROM licenses l
+        LEFT JOIN users u ON l.user_id = u.id
+        LEFT JOIN products p ON l.product_id = p.id
+        {where_sql}
+        ORDER BY l.created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        params + [per_page, offset],
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        'licenses': [
+            {
+                'id': r['id'],
+                'licenseKey': r['license_key'],
+                'productId': r['product_id'],
+                'productName': r.get('product_name'),
+                'userId': r.get('user_id'),
+                'userEmail': r.get('user_email'),
+                'userName': r.get('user_name'),
+                'machineId': r.get('machine_id'),
+                'status': r.get('status') or 'active',
+                'activatedAt': r['activated_at'].isoformat() if r.get('activated_at') else None,
+                'expiresAt': r['expires_at'].isoformat() if r.get('expires_at') else None,
+                'lastCheckAt': r['last_check_at'].isoformat() if r.get('last_check_at') else None,
+                'createdAt': r['created_at'].isoformat() if r.get('created_at') else None,
+            }
+            for r in rows
+        ],
+        'pagination': {
+            'page': page,
+            'perPage': per_page,
+            'total': total,
+            'totalPages': (total + per_page - 1) // per_page,
+        },
+    })
+
+
+@admin_bp.route('/licenses/<license_key>/disable', methods=['POST'])
+@_require_admin
+def disable_license(license_key):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT id, status FROM licenses WHERE license_key = %s', (license_key,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'License không tồn tại'}), 404
+
+    cur.execute(
+        "UPDATE licenses SET status = 'inactive', machine_id = NULL, machine_fingerprint = NULL, last_check_at = NOW() WHERE license_key = %s",
+        (license_key,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Đã vô hiệu hóa key'})
+
+
+@admin_bp.route('/licenses/<license_key>', methods=['DELETE'])
+@_require_admin
+def delete_license(license_key):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT id FROM licenses WHERE license_key = %s', (license_key,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'License không tồn tại'}), 404
+
+    # Giữ nguyên orders.license_key để phía user còn biết key đã bị xóa/vô hiệu.
+    cur.execute('DELETE FROM licenses WHERE license_key = %s', (license_key,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True, 'message': 'Đã xóa key'})
+
 
 @admin_bp.route('/deposits', methods=['GET'])
 @_require_admin

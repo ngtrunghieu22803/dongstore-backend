@@ -84,6 +84,11 @@ def init_db():
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS install_guide TEXT",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS screenshots TEXT",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS preview_audio TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS duration_options TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS duration_prices TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS require_duration INTEGER DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS app_download_url TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS app_installer_path TEXT",
     ]:
         cur.execute(col_sql)
 
@@ -104,6 +109,7 @@ def init_db():
         """
     )
     cur.execute("ALTER TABLE sounds ADD COLUMN IF NOT EXISTS storage TEXT DEFAULT 'minio'")
+    cur.execute("ALTER TABLE sounds ADD COLUMN IF NOT EXISTS price INTEGER DEFAULT 0")
 
     cur.execute(
         """
@@ -164,6 +170,35 @@ def init_db():
         )
     """)
 
+    # Licenses table - lưu trữ license key, secret, và binding info
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id TEXT PRIMARY KEY,
+            license_key TEXT UNIQUE NOT NULL,
+            license_secret_hash TEXT NOT NULL,
+            product_id TEXT NOT NULL REFERENCES products(id),
+            user_id TEXT REFERENCES users(id),
+            machine_id TEXT,
+            machine_fingerprint TEXT,
+            status TEXT DEFAULT 'active',
+            activated_at TIMESTAMPTZ DEFAULT NOW(),
+            expires_at TIMESTAMPTZ,
+            last_check_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+    cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS display_title TEXT")
+    cur.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS free_hwid_reset_after TIMESTAMPTZ")
+
+    # Index cho licenses
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses(license_key)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)
+    """)
+
     conn.commit()
 
     cur.execute("SELECT COUNT(*) AS c FROM products")
@@ -183,6 +218,41 @@ def init_db():
             (str(uuid.uuid4()), "adminDongstore", password_hash, "Quản trị viên", "admin"),
         )
         print("✅ Default admin account: adminDongstore / (ADMIN_SEED_PASSWORD hoặc mặc định trong get_admin_seed_password)")
+
+    # Đồng bộ âm thanh có giá → products (checkout dùng cùng id)
+    try:
+        sound_cat = "Âm thanh"
+        cur.execute(
+            """
+            SELECT id, name, description, price, is_active
+            FROM sounds
+            WHERE COALESCE(price, 0) > 0 AND COALESCE(is_active, 1) = 1
+            """
+        )
+        for srow in cur.fetchall():
+            sd = dict(srow)
+            cur.execute(
+                """
+                INSERT INTO products (id, name, category, price, description, features, stock, is_active, require_duration, emoji)
+                VALUES (%s, %s, %s, %s, %s, '[]', -1, 1, 0, '🎵')
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    category = EXCLUDED.category,
+                    price = EXCLUDED.price,
+                    description = COALESCE(EXCLUDED.description, products.description),
+                    is_active = 1,
+                    require_duration = 0
+                """,
+                (
+                    sd["id"],
+                    sd["name"],
+                    sound_cat,
+                    int(sd["price"]),
+                    sd.get("description") or "",
+                ),
+            )
+    except Exception as ex:
+        print("⚠️  Backfill sound → products:", ex)
 
     conn.commit()
     cur.close()

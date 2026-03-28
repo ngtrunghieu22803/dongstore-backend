@@ -2,18 +2,34 @@ from flask import Blueprint, request, jsonify, redirect, current_app
 from urllib.parse import urlencode
 import bcrypt
 import uuid
-import jwt
 import requests
+import re
 from db import get_db
-from auth import generate_tokens, save_session, require_auth, hash_token
+from auth import generate_tokens, save_session, require_auth, hash_token, decode_jwt, is_active_session_token
 
 auth_bp = Blueprint('auth', __name__)
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _is_valid_email(email: str) -> bool:
+    return bool(_EMAIL_RE.match(email or ''))
+
+
+def _is_strong_password(password: str) -> bool:
+    if len(password) < 8:
+        return False
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    return has_upper and has_lower and has_digit
+
 
 # ─── Email/Password Auth ───────────────────────────────────────────────────────
 
 @auth_bp.route('/register', methods=['POST'])
 def register():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
     name = data.get('name', '').strip()
@@ -21,8 +37,11 @@ def register():
     if not email or not password:
         return jsonify({'error': 'Email và mật khẩu là bắt buộc'}), 400
 
-    if len(password) < 6:
-        return jsonify({'error': 'Mật khẩu phải có ít nhất 6 ký tự'}), 400
+    if not _is_valid_email(email):
+        return jsonify({'error': 'Email không hợp lệ'}), 400
+
+    if not _is_strong_password(password):
+        return jsonify({'error': 'Mật khẩu phải từ 8 ký tự, gồm chữ hoa, chữ thường và số'}), 400
 
     conn = get_db()
     cur = conn.cursor()
@@ -53,7 +72,7 @@ def register():
 
 @auth_bp.route('/login', methods=['POST'])
 def login():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     email_or_name = data.get('email', '').strip().lower()
     password = data.get('password', '')
 
@@ -70,7 +89,6 @@ def login():
     row = cur.fetchone()
 
     if not row:
-        print(f"[LOGIN] ❌ Không tìm thấy user: '{email_or_name}'")
         return jsonify({'error': 'Tên đăng nhập/email hoặc mật khẩu không đúng'}), 401
 
     pw_stored = row['password']
@@ -81,7 +99,6 @@ def login():
 
     pwd_bytes = password.encode('utf-8')
     match = bcrypt.checkpw(pwd_bytes, pw_stored)
-    print(f"[LOGIN] identifier='{email_or_name}' | email_db='{row['email']}' | name_db='{row['name']}' | hash='{row['password'][:30]}...' | bcrypt_match={match}")
 
     if not match:
         return jsonify({'error': 'Tên đăng nhập/email hoặc mật khẩu không đúng'}), 401
@@ -100,21 +117,18 @@ def login():
 
 @auth_bp.route('/refresh', methods=['POST'])
 def refresh():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     refresh_token = data.get('refreshToken', '')
 
     if not refresh_token:
         return jsonify({'error': 'Refresh token là bắt buộc'}), 400
 
-    try:
-        payload = jwt.decode(refresh_token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
-    except jwt.ExpiredSignatureError:
-        return jsonify({'error': 'Refresh token đã hết hạn'}), 401
-    except jwt.InvalidTokenError:
+    payload = decode_jwt(refresh_token)
+    if not payload or payload.get('type') != 'refresh':
         return jsonify({'error': 'Invalid refresh token'}), 401
 
-    if payload.get('type') != 'refresh':
-        return jsonify({'error': 'Invalid refresh token'}), 401
+    if not is_active_session_token(refresh_token, payload.get('userId')):
+        return jsonify({'error': 'Refresh token invalid or revoked'}), 401
 
     conn = get_db()
     cur = conn.cursor()
@@ -123,6 +137,10 @@ def refresh():
 
     if not row:
         return jsonify({'error': 'User not found'}), 401
+
+    # Rotation: thu hồi refresh token cũ rồi cấp mới
+    cur.execute('DELETE FROM sessions WHERE token_hash = %s', (hash_token(refresh_token),))
+    conn.commit()
 
     new_access, new_refresh = generate_tokens(row['id'], row['email'], row['role'])
     save_session(row['id'], new_access, 1)
@@ -142,9 +160,12 @@ def logout():
     if token:
         conn = get_db()
         cur = conn.cursor()
+        # Thu hồi toàn bộ session của user hiện tại để logout sạch trên mọi token
+        cur.execute('DELETE FROM sessions WHERE user_id = %s', (request.user['id'],))
+        # Giữ thêm dòng xóa theo token hiện tại để tương thích logic cũ
         cur.execute('DELETE FROM sessions WHERE token_hash = %s', (hash_token(token),))
         conn.commit()
-    return jsonify({'message': 'Đăng xuất thành công'})
+    return jsonify({'message': 'Đăng xuất thành công'}), 200
 
 
 @auth_bp.route('/me', methods=['GET'])
@@ -163,15 +184,15 @@ def get_me():
 @require_auth
 def change_password():
     """Đổi mật khẩu: yêu cầu mật khẩu cũ để xác nhận."""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     current_password = data.get('currentPassword', '')
     new_password = data.get('newPassword', '')
 
     if not current_password or not new_password:
         return jsonify({'error': 'Mật khẩu hiện tại và mật khẩu mới là bắt buộc'}), 400
 
-    if len(new_password) < 6:
-        return jsonify({'error': 'Mật khẩu mới phải có ít nhất 6 ký tự'}), 400
+    if not _is_strong_password(new_password):
+        return jsonify({'error': 'Mật khẩu mới phải từ 8 ký tự, gồm chữ hoa, chữ thường và số'}), 400
 
     if current_password == new_password:
         return jsonify({'error': 'Mật khẩu mới phải khác mật khẩu hiện tại'}), 400
@@ -199,9 +220,11 @@ def change_password():
 
     new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cur.execute('UPDATE users SET password = %s WHERE id = %s', (new_hash, request.user['id']))
+    # Thu hồi toàn bộ sessions để buộc đăng nhập lại sau khi đổi mật khẩu
+    cur.execute('DELETE FROM sessions WHERE user_id = %s', (request.user['id'],))
     conn.commit()
 
-    return jsonify({'message': 'Đổi mật khẩu thành công'})
+    return jsonify({'message': 'Đổi mật khẩu thành công. Vui lòng đăng nhập lại.'})
 
 
 # ─── Google OAuth ──────────────────────────────────────────────────────────────
@@ -224,12 +247,17 @@ def _frontend_url():
 def _google_redirect(frontend_path, use_callback_page=True):
     """Redirect về frontend với query params.
 
-    Khi use_callback_page=True (mặc định), redirect sang trang riêng
-    /pages/auth-callback.html để xử lý auth — tránh race condition với includeHtml.
+    Mặc định ưu tiên route SPA `/auth/callback` (frontend React).
+    Có thể override bằng GOOGLE_CALLBACK_PATH trong .env.
     """
     base = _frontend_url()
+    callback_path = (current_app.config.get('GOOGLE_CALLBACK_PATH') or '/auth/callback').strip()
+
     if use_callback_page:
-        base = base.rstrip('/') + '/pages/auth-callback.html'
+        if not callback_path.startswith('/'):
+            callback_path = '/' + callback_path
+        base = base.rstrip('/') + callback_path
+
     separator = '&' if '?' in base else '?'
     return f'{base}{separator}{frontend_path}'
 
@@ -358,6 +386,5 @@ def google_auth_callback():
         })
         return redirect(_google_redirect(qs))
 
-    except requests.exceptions.RequestException as e:
-        print(f'Google OAuth error: {e}')
+    except requests.exceptions.RequestException:
         return redirect(_google_redirect('auth_error=network_error'))

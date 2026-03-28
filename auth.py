@@ -2,7 +2,6 @@
 Auth utilities: JWT, sessions, password hashing.
 """
 import jwt
-import bcrypt
 import hashlib
 import datetime
 import uuid
@@ -14,6 +13,33 @@ from db import get_db
 def hash_token(token: str) -> str:
     """Băm token bằng SHA-256 rồi lấy hex ngắn để lưu vào DB."""
     return hashlib.sha256(token.encode()).hexdigest()[:32]
+
+
+def decode_jwt(token: str):
+    """Decode JWT, trả về payload hoặc None nếu token không hợp lệ/hết hạn."""
+    try:
+        return jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+
+
+def is_active_session_token(token: str, user_id: str = None) -> bool:
+    """Kiểm tra token còn session hợp lệ trong DB hay không."""
+    conn = get_db()
+    cur = conn.cursor()
+    if user_id:
+        cur.execute(
+            'SELECT 1 FROM sessions WHERE user_id = %s AND token_hash = %s AND expires_at > NOW() LIMIT 1',
+            (user_id, hash_token(token)),
+        )
+    else:
+        cur.execute(
+            'SELECT 1 FROM sessions WHERE token_hash = %s AND expires_at > NOW() LIMIT 1',
+            (hash_token(token),),
+        )
+    row = cur.fetchone()
+    cur.close()
+    return bool(row)
 
 
 def generate_tokens(user_id: str, email: str, role: str = 'user'):
@@ -58,20 +84,18 @@ def save_session(user_id: str, token: str, hours: int):
 
 
 def _decode_token(token: str):
-    """Decode JWT và kiểm tra session. Trả về payload dict hoặc None."""
-    try:
-        payload = jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+    """Decode access token và kiểm tra session. Trả về payload dict hoặc None."""
+    payload = decode_jwt(token)
+    if not payload:
         return None
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        'SELECT * FROM sessions WHERE user_id = %s AND token_hash = %s AND expires_at > NOW()',
-        (payload['userId'], hash_token(token)),
-    )
-    session = cur.fetchone()
-    cur.close()
-    return payload if session else None
+
+    if payload.get('type') != 'access':
+        return None
+
+    if not is_active_session_token(token, payload.get('userId')):
+        return None
+
+    return payload
 
 
 def require_auth(f):

@@ -6,10 +6,12 @@ Biến môi trường:
   MS_GRAPH_TENANT_ID, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET
   MS_GRAPH_DRIVE_USER — UPN (email) hoặc object id của user sở hữu OneDrive
   ONEDRIVE_SOUNDS_FOLDER — tiền tố trong OneDrive (mặc định DongStore); file = folder/object_name (vd. DongStore/sounds/abc.mp3)
+  ONEDRIVE_APP_INSTALLER_FOLDER — đường dẫn đầy đủ từ root OneDrive tới thư mục chứa file cài app (mặc định DongStore_sounds/phanmem)
 """
 from __future__ import annotations
 
 import os
+import re
 import urllib.parse
 from typing import Dict, Optional, Tuple
 
@@ -33,6 +35,11 @@ def _cfg_from_app() -> Dict[str, str]:
                 .strip()
                 .strip("/")
             ),
+            "app_installer_folder": (
+                (current_app.config.get("ONEDRIVE_APP_INSTALLER_FOLDER") or "DongStore_sounds/phanmem")
+                .strip()
+                .strip("/")
+            ),
         }
     except RuntimeError:
         return _cfg_from_env()
@@ -45,6 +52,11 @@ def _cfg_from_env() -> Dict[str, str]:
         "client_secret": os.environ.get("MS_GRAPH_CLIENT_SECRET", "").strip(),
         "drive_user": os.environ.get("MS_GRAPH_DRIVE_USER", "").strip(),
         "folder": os.environ.get("ONEDRIVE_SOUNDS_FOLDER", "DongStore").strip().strip("/"),
+        "app_installer_folder": os.environ.get(
+            "ONEDRIVE_APP_INSTALLER_FOLDER", "DongStore_sounds/phanmem"
+        )
+        .strip()
+        .strip("/"),
     }
 
 
@@ -171,7 +183,7 @@ def graph_put_file(
     cfg = _cfg_from_app()
     enc = _encode_drive_path(relative_path)
     user = _user_segment(cfg["drive_user"])
-    _ensure_folder_structure(cfg, enc)
+    _ensure_folder_structure(cfg, relative_path)
     if len(data) > _SIMPLE_PUT_MAX:
         return _graph_upload_session(cfg, enc, user, data)
 
@@ -205,6 +217,49 @@ def graph_delete_file(relative_path: str) -> None:
     r = requests.delete(url, headers=_headers(cfg), timeout=60)
     if r.status_code not in (204, 404):
         raise RuntimeError(f"Graph DELETE {r.status_code}: {r.text[:200]}")
+
+
+def graph_get_download_url(full_relative_path: str) -> Optional[str]:
+    """Lấy @microsoft.graph.downloadUrl (đường dẫn đầy đủ từ root drive)."""
+    path = (full_relative_path or "").strip().strip("/")
+    if not path:
+        return None
+    cfg = _cfg_from_app()
+    if not cfg["tenant_id"]:
+        return None
+    enc = _encode_drive_path(path)
+    user = _user_segment(cfg["drive_user"])
+    url = f"{GRAPH}/users/{user}/drive/root:/{enc}"
+    r = requests.get(url, headers=_headers(cfg), timeout=30)
+    if r.status_code != 200:
+        return None
+    return r.json().get("@microsoft.graph.downloadUrl")
+
+
+def upload_product_app_installer(product_id: str, original_filename: str, data: bytes, content_type: str) -> str:
+    """
+    Upload file cài app lên OneDrive. Trả về path đầy đủ từ root (lưu products.app_installer_path).
+    Thư mục DongStore_sounds/phanmem được tạo tự động nếu chưa có.
+    """
+    cfg = _cfg_from_app()
+    base = (cfg.get("app_installer_folder") or "DongStore_sounds/phanmem").strip().strip("/")
+    raw_name = os.path.basename(original_filename or "") or "app.bin"
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw_name)
+    if not safe or safe == "_":
+        safe = "app.bin"
+    if len(safe) > 160:
+        safe = safe[-160:]
+    rel = f"{base}/{product_id}_{safe}"
+    code, err = graph_put_file(rel, data, content_type or "application/octet-stream")
+    if code not in (200, 201):
+        raise RuntimeError(err or f"Graph upload {code}")
+    return rel
+
+
+def delete_product_app_installer(full_relative_path: str) -> None:
+    path = (full_relative_path or "").strip().strip("/")
+    if path:
+        graph_delete_file(path)
 
 
 def _rel_for_object(object_name: str) -> str:

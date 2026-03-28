@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from db import get_db
 from auth import require_auth
+from routes.orders import is_sound_product
 
 PAYMENT_EXPIRE_MINUTES = 30
 
@@ -121,11 +122,19 @@ def payment_callback():
     new_status = 'completed' if status in ('success', 'completed') else 'cancelled'
 
     if new_status == 'completed':
-        license_key = generate_license_key(order['product_id'][:2].upper())
-        cur.execute(
-            'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
-            (new_status, license_key, order_id)
-        )
+        cur.execute('SELECT * FROM products WHERE id = %s', (order['product_id'],))
+        prod = cur.fetchone()
+        if prod and is_sound_product(prod):
+            cur.execute(
+                'UPDATE orders SET status = %s, license_key = NULL, updated_at = NOW() WHERE id = %s',
+                (new_status, order_id),
+            )
+        else:
+            license_key = generate_license_key(order['product_id'][:2].upper())
+            cur.execute(
+                'UPDATE orders SET status = %s, license_key = %s, updated_at = NOW() WHERE id = %s',
+                (new_status, license_key, order_id),
+            )
     else:
         cur.execute('UPDATE orders SET status = %s, updated_at = NOW() WHERE id = %s', (new_status, order_id))
     conn.commit()
@@ -159,6 +168,29 @@ def confirm_payment():
         snapshot = json.loads(order['product_snapshot']) if order['product_snapshot'] else {}
     except Exception:
         snapshot = {}
+
+    cur.execute('SELECT * FROM products WHERE id = %s', (order['product_id'],))
+    product = cur.fetchone()
+
+    if product and is_sound_product(product):
+        cur.execute(
+            'UPDATE orders SET status = %s, license_key = NULL, updated_at = NOW() WHERE id = %s',
+            ('completed', order_id),
+        )
+        conn.commit()
+        return jsonify({
+            'success': True,
+            'licenseKey': None,
+            'isSoundOrder': True,
+            'order': {
+                'id': order_id,
+                'product': snapshot.get('name', ''),
+                'date': order['created_at'],
+                'price': order['total_price'],
+                'status': 'completed',
+                'key': None,
+            },
+        })
 
     license_key = generate_license_key(order['product_id'][:2].upper())
     cur.execute(

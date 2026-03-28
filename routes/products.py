@@ -138,6 +138,18 @@ def get_products():
             p['installGuide'] = p['install_guide']
         if 'preview_audio' in p:
             p['previewAudio'] = p['preview_audio']
+        try:
+            p['duration_options'] = json.loads(p['duration_options']) if p.get('duration_options') else []
+        except Exception:
+            p['duration_options'] = []
+        try:
+            p['duration_prices'] = json.loads(p['duration_prices']) if p.get('duration_prices') else {}
+        except Exception:
+            p['duration_prices'] = {}
+        p['require_duration'] = bool(p.get('require_duration'))
+        # Không public link / path tải app — chỉ buyer thấy qua GET /orders
+        p.pop('app_download_url', None)
+        p.pop('app_installer_path', None)
         products.append(p)
 
     return jsonify({'products': products})
@@ -163,6 +175,17 @@ def get_product(product_id):
         p['installGuide'] = p['install_guide']
     if 'preview_audio' in p:
         p['previewAudio'] = p['preview_audio']
+    try:
+        p['duration_options'] = json.loads(p['duration_options']) if p.get('duration_options') else []
+    except Exception:
+        p['duration_options'] = []
+    try:
+        p['duration_prices'] = json.loads(p['duration_prices']) if p.get('duration_prices') else {}
+    except Exception:
+        p['duration_prices'] = {}
+    p['require_duration'] = bool(p.get('require_duration'))
+    p.pop('app_download_url', None)
+    p.pop('app_installer_path', None)
     return jsonify(p)
 
 
@@ -194,15 +217,28 @@ def presign_product_image():
 
 @products_bp.route('/sounds', methods=['GET'])
 def get_sounds():
-    """Danh sách âm thanh cho trang kho âm thanh (không cần auth)."""
+    """Danh sách âm thanh cho trang kho âm thanh (không cần auth).
+    Query params:
+      - type: 'free' | 'paid' | '' (mặc định: all)
+    """
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('SELECT * FROM sounds WHERE is_active = 1 ORDER BY created_at DESC')
+
+    sound_type = request.args.get('type', '').lower()
+    if sound_type == 'free':
+        cur.execute('SELECT * FROM sounds WHERE is_active = 1 AND COALESCE(price, 0) = 0 ORDER BY created_at DESC')
+    elif sound_type == 'paid':
+        cur.execute('SELECT * FROM sounds WHERE is_active = 1 AND COALESCE(price, 0) > 0 ORDER BY created_at DESC')
+    else:
+        cur.execute('SELECT * FROM sounds WHERE is_active = 1 ORDER BY created_at DESC')
+
     rows = cur.fetchall()
     sounds = [dict(r) for r in rows]
     for s in sounds:
         s['id'] = s['id']
         s['streamUrl'] = _abs_url(f'/api/products/sounds/{s["id"]}/stream')
+        s['price'] = s.get('price') or 0
+        s['duration'] = s.get('duration_seconds')
         if s.get('created_at'):
             s['createdAt'] = s['created_at'].isoformat() if hasattr(s['created_at'], 'isoformat') else str(s['created_at'])
     return jsonify({'sounds': sounds})
