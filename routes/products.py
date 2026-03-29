@@ -244,6 +244,170 @@ def get_sounds():
     return jsonify({'sounds': sounds})
 
 
+def _validate_sound_import_for_app(sound_id: str):
+    """
+    Kiểm tra license tc001 + máy + quyền mua (nếu trả phí).
+    Trả về:
+      (tuple, None) — (jsonify(...), status_code) để return luôn từ route
+      (None, dict) — user_id, object_name, storage, price (int)
+    """
+    license_key = (request.headers.get('X-License-Key') or '').strip()
+    machine_id = (request.headers.get('X-Machine-Id') or '').strip()
+    if not license_key or not machine_id:
+        return (jsonify({'error': 'Thiếu X-License-Key hoặc X-Machine-Id'}), 401), None
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT l.user_id, l.machine_id, l.expires_at
+            FROM licenses l
+            WHERE l.license_key = %s AND l.status = 'active' AND l.product_id = %s
+            """,
+            (license_key, 'tc001'),
+        )
+        lic = cur.fetchone()
+        if not lic:
+            return (jsonify({'error': 'License app không hợp lệ'}), 401), None
+
+        exp = lic.get('expires_at')
+        if exp is not None and hasattr(exp, 'timestamp'):
+            try:
+                if exp.timestamp() < time.time():
+                    return (jsonify({'error': 'License đã hết hạn'}), 401), None
+            except Exception:
+                pass
+
+        if lic.get('machine_id') and lic['machine_id'] != machine_id:
+            return (jsonify({'error': 'License không khớp máy này'}), 403), None
+
+        cur.execute(
+            """
+            SELECT object_name, storage, COALESCE(price, 0) AS price
+            FROM sounds WHERE id = %s AND is_active = 1
+            """,
+            (sound_id,),
+        )
+        sound = cur.fetchone()
+        if not sound:
+            return (jsonify({'error': 'Âm thanh không tồn tại'}), 404), None
+
+        user_id = lic['user_id']
+        # Giá hiển thị/checkout lấy từ `products`; `sounds.price` có thể lệch → phải lấy max để không coi nhầm SP trả phí là miễn phí.
+        price = int(sound['price'] or 0)
+        cur.execute(
+            "SELECT COALESCE(price, 0) AS p FROM products WHERE id = %s AND COALESCE(is_active, 1) = 1",
+            (sound_id,),
+        )
+        prow = cur.fetchone()
+        if prow:
+            price = max(price, int(prow["p"] or 0))
+
+        if price > 0:
+            if not user_id:
+                return (
+                    jsonify({
+                        'error': 'License cần gắn tài khoản Động Store để xác minh đã mua âm thanh trả phí.',
+                    }),
+                    403,
+                ), None
+            cur.execute(
+                """
+                SELECT 1 FROM orders
+                WHERE user_id = %s AND product_id = %s AND status IN ('completed', 'paid')
+                LIMIT 1
+                """,
+                (user_id, sound_id),
+            )
+            if not cur.fetchone():
+                return (jsonify({'error': 'Tài khoản của license chưa mua âm thanh này'}), 403), None
+
+        object_name = sound['object_name']
+        storage = sound.get('storage') or 'minio'
+        return None, {
+            'user_id': user_id,
+            'object_name': object_name,
+            'storage': storage,
+            'price': price,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+@products_bp.route('/sounds/<sound_id>/import-for-app', methods=['GET'])
+def sound_import_for_app(sound_id: str):
+    """
+    Tải file đầy đủ cho app desktop — bắt buộc license sản phẩm app (tc001) + đúng máy đã kích hoạt.
+    - Âm thanh miễn phí: chỉ cần license hợp lệ.
+    - Âm thanh trả phí: user_id của license phải có đơn completed/paid cho đúng sound_id.
+    Headers: X-License-Key, X-Machine-Id
+    """
+    err, ctx = _validate_sound_import_for_app(sound_id)
+    if err:
+        return err
+    if not ctx:
+        return jsonify({'error': 'Lỗi xác thực'}), 500
+
+    object_name = ctx['object_name']
+    storage = ctx['storage']
+
+    try:
+        resp, content_type = stream_sound(object_name, storage=storage)
+        body = resp.read() if hasattr(resp, 'read') else resp
+        if hasattr(resp, 'close'):
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except ValueError:
+        return jsonify({'error': 'File không tìm thấy'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    out = Response(body, mimetype=content_type or 'audio/mpeg')
+    out.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    out.headers['Pragma'] = 'no-cache'
+    return out
+
+
+@products_bp.route('/sounds/<sound_id>/import-ack', methods=['POST'])
+def sound_import_ack(sound_id: str):
+    """
+    Electron gọi sau khi tải file import-for-app thành công — ghi nhận để web (cùng user store) hiển thị "đã thêm vào app".
+    Cùng headers với import-for-app: X-License-Key, X-Machine-Id
+    """
+    err, ctx = _validate_sound_import_for_app(sound_id)
+    if err:
+        return err
+    if not ctx:
+        return jsonify({'error': 'Lỗi xác thực'}), 500
+
+    user_id = ctx.get('user_id')
+    if not user_id:
+        return jsonify({
+            'error': 'License chưa gắn tài khoản Động Store — không đồng bộ được trạng thái với web.',
+        }), 403
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO user_sound_imports (user_id, product_id)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id, product_id) DO NOTHING
+            """,
+            (user_id, sound_id),
+        )
+        conn.commit()
+        return jsonify({'ok': True, 'productId': sound_id})
+    finally:
+        cur.close()
+        conn.close()
+
+
 @products_bp.route('/sounds/<sound_id>/stream', methods=['GET'])
 def stream_sound_public(sound_id: str):
     """Stream file âm thanh cho user nghe thử (không cần auth, có rate limit)."""

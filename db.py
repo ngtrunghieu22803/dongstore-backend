@@ -199,6 +199,81 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_licenses_user_id ON licenses(user_id)
     """)
 
+    # Âm thanh đã thêm vào app (xác nhận từ Electron sau khi tải OK — đồng bộ với web)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_sound_imports (
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            product_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (user_id, product_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_user_sound_imports_user
+        ON user_sound_imports(user_id)
+        """
+    )
+
+    # Đăng ký ứng dụng desktop (Electron) — mỗi app một slug, feed riêng
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS desktop_apps (
+            id TEXT PRIMARY KEY,
+            slug TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+
+    # Bản cài (electron-updater: latest.yml + NSIS exe) — theo từng app_slug
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS desktop_app_releases (
+            id TEXT PRIMARY KEY,
+            app_slug TEXT NOT NULL,
+            version TEXT NOT NULL,
+            notes TEXT,
+            installer_filename TEXT NOT NULL,
+            installer_object_key TEXT NOT NULL,
+            installer_size BIGINT NOT NULL,
+            installer_sha512 TEXT NOT NULL,
+            yml_content TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute(
+        "ALTER TABLE desktop_app_releases ADD COLUMN IF NOT EXISTS app_slug TEXT"
+    )
+    cur.execute(
+        """
+        UPDATE desktop_app_releases
+        SET app_slug = 'tiengcuoi-dong'
+        WHERE app_slug IS NULL OR TRIM(app_slug) = ''
+        """
+    )
+    cur.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_desktop_releases_app_created
+        ON desktop_app_releases(app_slug, created_at DESC)
+        """
+    )
+
+    # Seed app mặc định (có thể thêm app khác trong admin)
+    cur.execute("SELECT id FROM desktop_apps WHERE slug = %s", ("tiengcuoi-dong",))
+    if not cur.fetchone():
+        cur.execute(
+            """
+            INSERT INTO desktop_apps (id, slug, display_name)
+            VALUES (%s, %s, %s)
+            """,
+            (str(uuid.uuid4()), "tiengcuoi-dong", "Tiếng Cười Động"),
+        )
+
     conn.commit()
 
     cur.execute("SELECT COUNT(*) AS c FROM products")

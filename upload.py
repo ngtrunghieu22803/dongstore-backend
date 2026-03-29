@@ -465,3 +465,78 @@ def delete_sound(object_name: str, storage: str = 'minio'):
         client.remove_object(SOUNDS_BUCKET, object_name)
     except Exception:
         pass
+
+
+# ─── Desktop app (Electron NSIS) — electron-updater generic, đa app theo app_slug ─
+DESKTOP_RELEASES_ROOT = 'desktop_releases'
+
+
+def _validate_app_slug(slug: str) -> str:
+    import re
+
+    s = (slug or '').strip().lower()
+    if not s or not re.match(r'^[a-z0-9][a-z0-9-]{0,62}$', s):
+        raise ValueError('app_slug chỉ gồm chữ thường, số, gạch ngang (vd. tiengcuoi-dong).')
+    return s
+
+
+def _validate_installer_filename(name: str) -> str:
+    import re
+
+    n = (name or '').strip()
+    if not n.lower().endswith('.exe'):
+        raise ValueError('Chỉ chấp nhận file cài đặt .exe (NSIS).')
+    if not re.match(r'^[\w\s\.\-\(\)]+\.exe$', n, re.IGNORECASE):
+        raise ValueError('Tên file không hợp lệ.')
+    return n
+
+
+def upload_desktop_installer_bytes(raw: bytes, filename: str, app_slug: str) -> str:
+    """
+    Upload bản cài lên bucket mặc định (public read).
+    Mỗi ứng dụng một thư mục: desktop_releases/<app_slug>/<filename>
+    Trả về object_key.
+    """
+    import io as _io
+
+    slug = _validate_app_slug(app_slug)
+    safe = _validate_installer_filename(filename)
+    if len(raw) > 600 * 1024 * 1024:
+        raise ValueError('File quá lớn (tối đa ~600MB).')
+
+    object_name = f'{DESKTOP_RELEASES_ROOT}/{slug}/{safe}'
+    client = get_minio_client()
+    bucket = get_bucket_name()
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)
+
+    client.put_object(
+        bucket,
+        object_name,
+        _io.BytesIO(raw),
+        length=len(raw),
+        content_type='application/vnd.microsoft.portable-executable',
+    )
+    return object_name
+
+
+def stream_desktop_installer(object_key: str):
+    """Trả về response object từ MinIO get_object."""
+    client = get_minio_client()
+    bucket = get_bucket_name()
+    return client.get_object(bucket, object_key)
+
+
+def delete_desktop_installer_object(object_key: str) -> None:
+    """Xóa file .exe bản cập nhật trên MinIO (object_key từ desktop_app_releases)."""
+    if not object_key or not isinstance(object_key, str):
+        raise ValueError('object_key không hợp lệ.')
+    key = object_key.strip()
+    if not key.startswith(f'{DESKTOP_RELEASES_ROOT}/'):
+        raise ValueError('Chỉ được xóa object trong desktop_releases/.')
+    client = get_minio_client()
+    bucket = get_bucket_name()
+    try:
+        client.remove_object(bucket, key)
+    except Exception as e:
+        raise ValueError(f'Không xóa được file trên MinIO: {e}') from e

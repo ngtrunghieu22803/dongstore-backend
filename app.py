@@ -20,6 +20,8 @@ from routes.wallet import wallet_bp
 from routes.secure import secure_bp
 from routes.license import license_bp
 from routes.validate import validate_bp
+from routes.me import me_bp
+from routes.desktop_public import desktop_public_bp, desktop_legacy_bp
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -166,6 +168,9 @@ app.register_blueprint(wallet_bp, url_prefix='/api/wallet')
 app.register_blueprint(secure_bp, url_prefix='/api/secure')
 app.register_blueprint(license_bp, url_prefix='/api/license')
 app.register_blueprint(validate_bp, url_prefix='/api')
+app.register_blueprint(me_bp, url_prefix='/api/me')
+app.register_blueprint(desktop_public_bp, url_prefix='/api/desktop-updates')
+app.register_blueprint(desktop_legacy_bp, url_prefix='/api/app-desktop')
 
 
 @app.route('/api/health', methods=['GET'])

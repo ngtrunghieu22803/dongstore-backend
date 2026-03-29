@@ -1,7 +1,10 @@
 """
 Admin routes: quản lý sản phẩm (CRUD). Yêu cầu role='admin'.
 """
+import base64
+import hashlib
 import json
+import re
 import uuid
 from flask import Blueprint, request, jsonify
 from db import get_db
@@ -1277,3 +1280,246 @@ def adjust_wallet_balance(user_id):
         'newBalance': new_balance,
         'note': note,
     })
+
+
+def _build_latest_yml(version: str, installer_filename: str, size: int, sha512_b64: str) -> str:
+    from datetime import datetime, timezone
+
+    rd = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    fn = installer_filename
+    fn_yml = f'"{fn}"' if (' ' in fn or ':' in fn) else fn
+    return (
+        f'version: {version}\n'
+        'files:\n'
+        f'  - url: {fn_yml}\n'
+        f'    sha512: {sha512_b64}\n'
+        f'    size: {size}\n'
+        f'path: {fn_yml}\n'
+        f'sha512: {sha512_b64}\n'
+        f"releaseDate: '{rd}'\n"
+    )
+
+
+_DESKTOP_SLUG_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,62}$')
+
+
+@admin_bp.route('/desktop-apps', methods=['GET'])
+@_require_admin
+def list_desktop_apps():
+    """Danh sách ứng dụng desktop đã đăng ký (mỗi app một feed /api/desktop-updates/<slug>)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT slug, display_name, created_at
+        FROM desktop_apps
+        ORDER BY display_name ASC
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get('created_at'):
+            d['createdAt'] = d['created_at'].isoformat()
+        d.pop('created_at', None)
+        out.append(d)
+    return jsonify({'apps': out})
+
+
+@admin_bp.route('/desktop-apps', methods=['POST'])
+@_require_admin
+def create_desktop_app():
+    """Đăng ký app mới: JSON { slug, display_name }."""
+    data = request.get_json(silent=True) or {}
+    slug = (data.get('slug') or '').strip().lower()
+    display_name = (data.get('display_name') or '').strip()
+    if not slug or not _DESKTOP_SLUG_RE.match(slug):
+        return jsonify({'error': 'slug chỉ gồm chữ thường, số, gạch ngang (vd. my-app).'}), 400
+    if not display_name:
+        return jsonify({'error': 'Thiếu display_name.'}), 400
+    if len(display_name) > 200:
+        return jsonify({'error': 'Tên hiển thị quá dài.'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM desktop_apps WHERE slug = %s', (slug,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Slug đã tồn tại.'}), 400
+
+    rid = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO desktop_apps (id, slug, display_name)
+        VALUES (%s, %s, %s)
+        """,
+        (rid, slug, display_name),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'ok': True, 'app': {'slug': slug, 'display_name': display_name}})
+
+
+@admin_bp.route('/desktop-releases', methods=['GET'])
+@_require_admin
+def list_desktop_releases():
+    """Lịch sử bản cài theo app: ?app_slug=... (mặc định tiengcuoi-dong)."""
+    app_slug = (request.args.get('app_slug') or 'tiengcuoi-dong').strip().lower()
+    if not _DESKTOP_SLUG_RE.match(app_slug):
+        return jsonify({'error': 'app_slug không hợp lệ.'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM desktop_apps WHERE slug = %s', (app_slug,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'App chưa tồn tại. Tạo app trước (desktop-apps).'}), 404
+
+    cur.execute(
+        """
+        SELECT id, app_slug, version, notes, installer_filename, installer_size, created_at
+        FROM desktop_app_releases
+        WHERE app_slug = %s
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        (app_slug,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get('created_at'):
+            d['createdAt'] = d['created_at'].isoformat()
+        d.pop('created_at', None)
+        out.append(d)
+    return jsonify({'releases': out})
+
+
+@admin_bp.route('/desktop-releases', methods=['POST'])
+@_require_admin
+def create_desktop_release():
+    """
+    Đăng bản cập nhật: multipart — app_slug, file (.exe), version (semver), notes (optional).
+    Feed: https://<API_HOST>/api/desktop-updates/<app_slug> (TCD_UPDATE_URL không có / cuối).
+    """
+    f = request.files.get('file')
+    app_slug = (request.form.get('app_slug') or '').strip().lower()
+    version = (request.form.get('version') or '').strip()
+    notes = (request.form.get('notes') or '').strip() or None
+
+    if not app_slug or not _DESKTOP_SLUG_RE.match(app_slug):
+        return jsonify({'error': 'Thiếu hoặc sai app_slug (vd. tiengcuoi-dong).'}), 400
+    if not f or not f.filename:
+        return jsonify({'error': 'Thiếu file cài đặt (.exe).'}), 400
+    if not version or not re.match(r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$', version):
+        return jsonify({'error': 'version phải dạng semver (vd. 0.2.0).'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM desktop_apps WHERE slug = %s', (app_slug,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'App chưa tồn tại. Tạo app trong admin (desktop-apps) trước.'}), 400
+
+    raw = f.read()
+    if not raw:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'File rỗng.'}), 400
+
+    filename = f.filename.split('/')[-1].split('\\')[-1]
+    try:
+        object_key = upload.upload_desktop_installer_bytes(raw, filename, app_slug)
+    except ValueError as e:
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+
+    sha512_b64 = base64.b64encode(hashlib.sha512(raw).digest()).decode('ascii')
+    size = len(raw)
+    yml_content = _build_latest_yml(version, filename, size, sha512_b64)
+
+    rid = str(uuid.uuid4())
+    cur.execute(
+        """
+        INSERT INTO desktop_app_releases
+        (id, app_slug, version, notes, installer_filename, installer_object_key, installer_size, installer_sha512, yml_content)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (rid, app_slug, version, notes, filename, object_key, size, sha512_b64, yml_content),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        'ok': True,
+        'release': {
+            'id': rid,
+            'appSlug': app_slug,
+            'version': version,
+            'installerFilename': filename,
+            'installerSize': size,
+        },
+        'hint': f'Đặt TCD_UPDATE_URL=https://<API_HOST>/api/desktop-updates/{app_slug} (HTTPS, không / cuối). '
+        'URL cũ /api/app-desktop vẫn dùng được cho app tiengcuoi-dong.',
+    })
+
+
+@admin_bp.route('/desktop-releases/<release_id>', methods=['DELETE'])
+@_require_admin
+def delete_desktop_release(release_id):
+    """
+    Xóa một bản cập nhật đã đăng: gỡ file trên MinIO + xóa dòng DB.
+    Query: app_slug (bắt buộc, phải khớp bản ghi).
+    """
+    app_slug = (request.args.get('app_slug') or '').strip().lower()
+    if not release_id or not str(release_id).strip():
+        return jsonify({'error': 'Thiếu release_id.'}), 400
+    if not app_slug or not _DESKTOP_SLUG_RE.match(app_slug):
+        return jsonify({'error': 'Thiếu hoặc sai app_slug (query).'}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, app_slug, installer_object_key
+        FROM desktop_app_releases
+        WHERE id = %s
+        """,
+        (release_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Không tìm thấy bản cập nhật.'}), 404
+    d = dict(row)
+    if d.get('app_slug') != app_slug:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'app_slug không khớp với bản ghi.'}), 400
+
+    object_key = d.get('installer_object_key') or ''
+    try:
+        upload.delete_desktop_installer_object(object_key)
+    except ValueError as e:
+        cur.close()
+        conn.close()
+        return jsonify({'error': str(e)}), 400
+
+    cur.execute('DELETE FROM desktop_app_releases WHERE id = %s', (release_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'ok': True})
