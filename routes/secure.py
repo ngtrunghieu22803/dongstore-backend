@@ -11,7 +11,9 @@ Endpoint format:
 """
 from flask import Blueprint, request, jsonify, current_app
 import time
+from threading import Lock
 from db import get_db
+from rate_limit import hit_rate, response_429
 from crypto import (
     SecureEnvelope,
     validate_timestamp,
@@ -23,6 +25,23 @@ from crypto import (
 )
 
 secure_bp = Blueprint('secure', __name__)
+_NONCES = {}
+_NONCE_LOCK = Lock()
+
+
+def _consume_nonce(nonce: str, window_sec: int = 300) -> bool:
+    if not nonce:
+        return False
+    now = int(time.time())
+    with _NONCE_LOCK:
+        cutoff = now - window_sec
+        stale = [k for k, v in _NONCES.items() if v < cutoff]
+        for k in stale:
+            _NONCES.pop(k, None)
+        if nonce in _NONCES:
+            return False
+        _NONCES[nonce] = now
+        return True
 
 
 def _get_encryption_key(license_key: str) -> bytes:
@@ -129,6 +148,8 @@ def activate_license():
         "encryptionKey": "derived_key_for_api_calls"
     }
     """
+    if not hit_rate("secure_license_activate", 25, 300):
+        return response_429(300)
     try:
         data = request.get_json() or {}
         license_key = data.get('licenseKey', '').strip()
@@ -214,6 +235,8 @@ def check_license():
         "serverTime": 1234567890
     }
     """
+    if not hit_rate("secure_license_check", 60, 60):
+        return response_429(60)
     try:
         data = request.get_json() or {}
         api_key = data.get('apiKey', '').strip()
@@ -303,6 +326,8 @@ def secure_api_call():
         "data": {...encrypted_result...}
     }
     """
+    if not hit_rate("secure_api_call", 100, 60):
+        return response_429(60)
     try:
         data = request.get_json() or {}
         api_key = data.get('apiKey', '').strip()
@@ -314,6 +339,9 @@ def secure_api_call():
         ts = data.get('ts', 0)
         if not validate_timestamp(ts, 300):
             return jsonify({'ok': False, 'error': 'Request đã hết hạn'}), 401
+        nonce = str(data.get('nonce', '')).strip()
+        if not _consume_nonce(nonce, 300):
+            return jsonify({'ok': False, 'error': 'Nonce không hợp lệ hoặc đã được dùng'}), 401
 
         # Parse apiKey
         parts = api_key.split(':')
@@ -425,6 +453,8 @@ def deactivate_license():
         "apiKey": "DS-XXXXXXXX-XXXXXXXX:machine_id"
     }
     """
+    if not hit_rate("secure_license_deactivate", 25, 300):
+        return response_429(300)
     try:
         data = request.get_json() or {}
         api_key = data.get('apiKey', '').strip()

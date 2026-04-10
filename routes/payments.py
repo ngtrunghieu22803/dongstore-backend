@@ -1,10 +1,17 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 import uuid
 import json
+import hmac
+import hashlib
+import time
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 from db import get_db
 from auth import require_auth
 from routes.orders import is_sound_product
+from routes.discounts import mark_discount_used_for_order
+from security_audit import log_security_event
+from rate_limit import hit_rate, response_429
 
 PAYMENT_EXPIRE_MINUTES = 30
 
@@ -21,6 +28,41 @@ def _cancel_expired_pending_orders() -> int:
     return cur.rowcount
 
 payments_bp = Blueprint('payments', __name__)
+_CALLBACK_NONCES = {}
+_CALLBACK_NONCES_LOCK = Lock()
+
+
+def _verify_callback_auth() -> bool:
+    secret = (current_app.config.get('PAYMENTS_CALLBACK_SECRET') or '').strip()
+    if not secret:
+        return False
+
+    signature = (request.headers.get('X-Payment-Signature') or '').strip().lower()
+    ts_raw = (request.headers.get('X-Payment-Timestamp') or '').strip()
+    nonce = (request.headers.get('X-Payment-Nonce') or '').strip()
+    if not signature or not ts_raw or not nonce:
+        return False
+    try:
+        ts = int(ts_raw)
+    except Exception:
+        return False
+    now = int(time.time())
+    if abs(now - ts) > 300:
+        return False
+
+    with _CALLBACK_NONCES_LOCK:
+        cutoff = now - 300
+        stale = [k for k, v in _CALLBACK_NONCES.items() if v < cutoff]
+        for k in stale:
+            _CALLBACK_NONCES.pop(k, None)
+        if nonce in _CALLBACK_NONCES:
+            return False
+        _CALLBACK_NONCES[nonce] = now
+
+    body = request.get_data() or b''
+    msg = f"{ts_raw}.{nonce}.".encode('utf-8') + body
+    expected = hmac.new(secret.encode('utf-8'), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
 def generate_license_key(prefix='DS'):
@@ -103,6 +145,12 @@ def create_payment_order():
 
 @payments_bp.route('/callback', methods=['POST'])
 def payment_callback():
+    if not _verify_callback_auth():
+        log_security_event(
+            "payment_callback_unauthorized",
+            message="Chữ ký callback thanh toán không hợp lệ hoặc thiếu header",
+        )
+        return jsonify({'error': 'Unauthorized callback'}), 401
     data = request.get_json() or {}
     payment_id = data.get('paymentId')
     order_id = data.get('orderId')
@@ -117,9 +165,17 @@ def payment_callback():
     order = cur.fetchone()
 
     if not order:
+        log_security_event(
+            "payment_callback_order_not_found",
+            message="Callback thanh toán: không tìm thấy đơn",
+            extra={"order_id": order_id, "payment_id": payment_id},
+        )
         return jsonify({'error': 'Đơn hàng không tồn tại'}), 404
 
     new_status = 'completed' if status in ('success', 'completed') else 'cancelled'
+    current_status = str(order.get('status') or '')
+    if current_status in ('completed', 'paid', 'cancelled'):
+        return jsonify({'success': True, 'idempotent': True, 'status': current_status})
 
     if new_status == 'completed':
         cur.execute('SELECT * FROM products WHERE id = %s', (order['product_id'],))
@@ -138,6 +194,14 @@ def payment_callback():
     else:
         cur.execute('UPDATE orders SET status = %s, updated_at = NOW() WHERE id = %s', (new_status, order_id))
     conn.commit()
+    if new_status in ('completed', 'paid'):
+        mark_discount_used_for_order(order_id)
+
+    log_security_event(
+        "payment_callback_ok",
+        message="Callback thanh toán xử lý thành công",
+        extra={"order_id": order_id, "payment_id": payment_id, "new_status": new_status},
+    )
 
     return jsonify({'success': True})
 
@@ -145,6 +209,9 @@ def payment_callback():
 @payments_bp.route('/confirm', methods=['POST'])
 @require_auth
 def confirm_payment():
+    # 25 req / 5 phút / user
+    if not hit_rate("payment_confirm", 25, 300, request.user["id"]):
+        return response_429(300)
     data = request.get_json() or {}
     order_id = data.get('orderId')
 
@@ -178,6 +245,7 @@ def confirm_payment():
             ('completed', order_id),
         )
         conn.commit()
+        mark_discount_used_for_order(order_id)
         return jsonify({
             'success': True,
             'licenseKey': None,
@@ -198,6 +266,7 @@ def confirm_payment():
         ('completed', license_key, order_id)
     )
     conn.commit()
+    mark_discount_used_for_order(order_id)
 
     return jsonify({
         'success': True,
@@ -211,6 +280,3 @@ def confirm_payment():
             'key': license_key,
         },
     })
-
-
-import json

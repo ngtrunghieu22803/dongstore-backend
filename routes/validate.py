@@ -14,6 +14,7 @@ import base64
 import json
 import secrets
 import time
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -22,8 +23,25 @@ from cryptography.fernet import Fernet
 from flask import Blueprint, request, jsonify, current_app
 
 from db import get_db
+from security_audit import log_security_event
+from rate_limit import hit_rate, response_429
 
 validate_bp = Blueprint("validate", __name__)
+_ADMIN_RATE = {}
+_ADMIN_RATE_LOCK = Lock()
+
+
+def _hit_admin_rate(limit: int = 30, window_sec: int = 60) -> bool:
+    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown")
+    now = int(time.time())
+    with _ADMIN_RATE_LOCK:
+        entries = [t for t in _ADMIN_RATE.get(ip, []) if t > now - window_sec]
+        if len(entries) >= limit:
+            _ADMIN_RATE[ip] = entries
+            return False
+        entries.append(now)
+        _ADMIN_RATE[ip] = entries
+        return True
 
 
 # ── Lazy-loaded signing key ───────────────────────────────────────────────────
@@ -102,10 +120,17 @@ def _require_admin_key(f):
     from functools import wraps
     @wraps(f)
     def decorated(*args, **kwargs):
+        if not _hit_admin_rate():
+            return jsonify({"error": "Too many requests"}), 429
         admin_key = current_app.config.get("ADMIN_KEY", "").strip()
         if not admin_key:
             return jsonify({"error": "ADMIN_KEY not configured"}), 500
         if request.headers.get("X-Admin-Key", "") != admin_key:
+            log_security_event(
+                "admin_key_invalid",
+                message="X-Admin-Key sai hoặc thiếu",
+                extra={"path": request.path},
+            )
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
     return decorated
@@ -152,6 +177,9 @@ def validate():
     payload.type = "permanent" | "days"
     payload.x = ngày hết hạn (ISO) nếu type=days
     """
+    # Công khai theo IP — 80 req / phút / IP
+    if not hit_rate("license_validate_public", 80, 60):
+        return response_429(60)
     data = request.get_json(silent=True) or {}
     code = str(data.get("code", "")).strip()
     hwid = str(data.get("hwid", "")).strip()

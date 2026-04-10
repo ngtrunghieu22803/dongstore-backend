@@ -16,16 +16,21 @@ import onedrive_graph
 
 def get_minio_client():
     """Khởi tạo MinIO client từ config."""
+    endpoint = current_app.config.get('MINIO_ENDPOINT', '')
+    access_key = current_app.config.get('MINIO_ACCESS_KEY', '')
+    secret_key = current_app.config.get('MINIO_SECRET_KEY', '')
+    if not endpoint or not access_key or not secret_key:
+        raise ValueError('MinIO configuration is incomplete')
     return Minio(
-        current_app.config.get('MINIO_ENDPOINT', 'minio01.vpsmmo.vn:9000'),
-        access_key=current_app.config.get('MINIO_ACCESS_KEY', 'nthieu228'),
-        secret_key=current_app.config.get('MINIO_SECRET_KEY', ''),
+        endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
         secure=True,
     )
 
 
 def get_bucket_name():
-    return current_app.config.get('MINIO_BUCKET', 'bucket-nthieu228')
+    return current_app.config.get('MINIO_BUCKET', '')
 
 
 def get_image_folder():

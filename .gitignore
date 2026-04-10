@@ -32,6 +32,16 @@ pnpm-debug.log*
 .env.local
 .env.*.local
 
+# Sensitive files
+keys.txt
+*.pem
+*.key
+*.p12
+*.crt
+*.jks
+secrets/
+private/
+
 # Editor / IDE
 .vscode/settings.json
 .vscode/launch.json

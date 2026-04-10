@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Dict, List, Tuple
 from db import get_db
 from upload import presign_from_public_url, stream_preview_audio, upload_preview_audio, stream_sound
+from rate_limit import hit_rate, response_429
 
 products_bp = Blueprint('products', __name__)
 
@@ -184,9 +185,119 @@ def get_product(product_id):
     except Exception:
         p['duration_prices'] = {}
     p['require_duration'] = bool(p.get('require_duration'))
+    p['require_first_deposit'] = bool(p.get('require_first_deposit'))
     p.pop('app_download_url', None)
     p.pop('app_installer_path', None)
     return jsonify(p)
+
+
+@products_bp.route('/<product_id>/free-download', methods=['GET'])
+def free_download_requires_deposit(product_id: str):
+    """
+    Tải app miễn phí cho một số sản phẩm đặc biệt:
+    - Không trừ tiền / không tạo đơn mới.
+    - Yêu cầu tài khoản có phát sinh giao dịch nạp tiền.
+    - Chỉ cho tải nếu số dư ví hiện tại >= 1.000đ.
+    """
+    from auth import require_auth  # import bên trong để tránh vòng import
+
+    @require_auth
+    def _inner(product_id_inner: str):
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, price, app_installer_path, app_download_url, require_first_deposit
+                FROM products
+                WHERE id = %s AND COALESCE(is_active, 1) = 1
+                """,
+                (product_id_inner,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({'error': 'Sản phẩm không tồn tại'}), 404
+
+            if not bool(row.get('require_first_deposit')):
+                return jsonify({'error': 'Sản phẩm này không hỗ trợ tải miễn phí bằng nạp tiền lần đầu.'}), 400
+
+            # 1) Chỉ cho tải nếu số dư ví hiện tại >= 1.000đ.
+            cur.execute(
+                """
+                SELECT COALESCE(balance, 0) AS balance
+                FROM wallets
+                WHERE user_id = %s
+                """,
+                (request.user['id'],),
+            )
+            bal_row = cur.fetchone()
+            balance = int(bal_row.get('balance') if bal_row else 0)
+            if balance < 1000:
+                return jsonify({
+                    'error': 'Số dư ví hiện tại chưa đủ. Vui lòng nạp ít nhất 1.000đ để tải tool này.'
+                }), 403
+
+            # 2) Xác nhận tài khoản có giao dịch nạp (đã có deposit thành công).
+            #    Trường hợp số dư được admin set trực tiếp cho user cũ trước khi logic
+            #    tạo deposits được thêm vào: backfill 1 record deposits để check nhất quán.
+            cur.execute(
+                """
+                SELECT 1
+                FROM deposits
+                WHERE user_id = %s AND status IN ('confirmed', 'completed')
+                LIMIT 1
+                """,
+                (request.user['id'],),
+            )
+            if not cur.fetchone():
+                import uuid
+
+                backfill_id = f"BF{uuid.uuid4().hex[:10].upper()}"
+                transfer_content = f"AUTO_BACKFILL_{backfill_id}"
+                cur.execute(
+                    """
+                    INSERT INTO deposits
+                        (id, user_id, amount, transfer_content, bank_name,
+                         account_number, account_name, qr_url,
+                         status, confirmed_at)
+                    VALUES
+                        (%s, %s, %s, %s, %s,
+                         %s, %s, %s,
+                         %s, NOW())
+                    """,
+                    (
+                        backfill_id,
+                        request.user['id'],
+                        balance,
+                        transfer_content,
+                        'admin_backfill',
+                        None,
+                        None,
+                        None,
+                        'completed',
+                    ),
+                )
+                conn.commit()
+
+            inst_path = (row.get('app_installer_path') or '').strip()
+            legacy = (row.get('app_download_url') or '').strip()
+            if not inst_path and not legacy:
+                return jsonify({'error': 'Tool chưa được cấu hình file cài đặt'}), 500
+
+            # Tái sử dụng cơ chế OneDrive / URL cũ: ưu tiên app_installer_path giống orders.get_order_app_installer
+            from onedrive_graph import graph_get_download_url
+
+            if inst_path:
+                download_url = graph_get_download_url(inst_path)
+            else:
+                download_url = legacy
+
+            return jsonify({'downloadUrl': download_url})
+        finally:
+            cur.close()
+            conn.close()
+
+    return _inner(product_id)
 
 
 @products_bp.route('/categories', methods=['GET'])
@@ -202,6 +313,8 @@ def get_categories():
 @products_bp.route('/presign', methods=['POST'])
 def presign_product_image():
     """Trả presigned URL để hiển thị ảnh MinIO (không cần auth)."""
+    if not hit_rate("product_presign", 45, 60):
+        return response_429(60)
     data = request.get_json() or {}
     url = data.get('url', '').strip()
     if not url:

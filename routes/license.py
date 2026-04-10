@@ -1,77 +1,83 @@
 """
 License API routes cho Electron App.
-- POST /api/license/activate — Kích hoạt + bind máy (body: form `_` = blob AES, bên trong JSON)
-- POST /api/license/check — Kiểm tra license (cùng định dạng `_`)
+- POST /api/license/activate — Kích hoạt + bind máy (JSON/form thường)
+- POST /api/license/check — Kiểm tra license (JSON/form thường)
 - POST /api/license/deactivate — Stub tương thích (200, không đổi DB); app mới không gọi.
 """
-from flask import Blueprint, request, jsonify, current_app, has_request_context
+from flask import Blueprint, request, jsonify, current_app
+import base64
 import json
-import os
 import time
 import secrets
 from db import get_db
-from crypto import derive_key_from_secret, decrypt_aes_256_cbc
-from urllib.parse import parse_qs
+from typing import Optional
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 license_bp = Blueprint('license', __name__)
 
-LICENSE_TRANSPORT_SALT = os.environ.get('LICENSE_TRANSPORT_SALT', 'tc-dong-v1')
-LICENSE_PAYLOAD_MAX_AGE_SEC = int(os.environ.get('LICENSE_PAYLOAD_MAX_AGE_SEC', '300'))
-
-
-def _license_transport_key_bytes() -> bytes:
-    if has_request_context():
-        secret = (current_app.config.get('SECURE_API_KEY') or '').strip()
-    else:
-        secret = ''
-    if not secret:
-        secret = os.environ.get('SECURE_API_KEY', 'secure-api-key-change-in-production-32chars').strip()
-    return derive_key_from_secret(secret, LICENSE_TRANSPORT_SALT)
-
-
-def _get_transport_blob() -> str:
-    """Lấy chuỗi `_` từ form hoặc parse thủ công raw body (proxy / client gửi lệch Content-Type)."""
-    b = (request.form.get('_') or '').strip()
-    if b:
-        return b
-    raw = request.get_data(cache=True, as_text=False) or b''
-    if not raw:
-        return ''
-    ct = (request.content_type or '').lower()
-    if 'application/json' in ct and raw[:1] in (b'{', b'['):
-        return ''
-    is_form = 'application/x-www-form-urlencoded' in ct
-    if not is_form and b'_=' not in raw[:16384]:
-        return ''
+def _get_signing_key() -> Optional[Ed25519PrivateKey]:
+    b64 = (current_app.config.get("SIGNING_PRIVATE_KEY_B64") or "").strip()
+    if not b64:
+        return None
     try:
-        text = raw.decode('utf-8')
+        raw = base64.b64decode(b64)
+        if len(raw) != 32:
+            return None
+        return Ed25519PrivateKey.from_private_bytes(raw)
     except Exception:
-        text = raw.decode('latin-1', errors='replace')
-    pairs = parse_qs(text, keep_blank_values=True, strict_parsing=False)
-    vals = pairs.get('_')
-    if not vals:
-        return ''
-    return (vals[0] or '').strip()
+        return None
 
 
-def _parse_obfuscated_license_body() -> dict:
-    blob = _get_transport_blob()
-    if not blob:
+def _canonical_json_bytes(payload: dict) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _signed_response(payload: dict, status_code: int = 200):
+    key = _get_signing_key()
+    if key is None:
+        # Fallback: không ký được thì trả plain (tránh làm app chết hoàn toàn).
+        return jsonify(payload), status_code
+    sig = key.sign(_canonical_json_bytes(payload))
+    return jsonify({
+        "payload": payload,
+        "sig": base64.b64encode(sig).decode("ascii"),
+    }), status_code
+
+
+def _respond(payload: dict, status_code: int = 200):
+    # Luồng license của app này trả signed response thống nhất (không còn nhánh client cũ).
+    # Trả HTTP 200 để client luôn parse body và verify chữ ký;
+    # mã trạng thái logic được nhúng trong payload._http.
+    signed_payload = dict(payload)
+    signed_payload.setdefault("_http", status_code)
+    return _signed_response(signed_payload, 200)
+
+
+def _parse_license_request_body() -> dict:
+    """
+    Chỉ nhận JSON hoặc form thường chứa trực tiếp
+    licenseKey/machineId/machineFingerprint.
+    """
+    data = {}
+
+    # JSON body
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+
+    # form body thường
+    if not data and request.form:
+        data = {
+            'licenseKey': (request.form.get('licenseKey') or '').strip(),
+            'machineId': (request.form.get('machineId') or '').strip(),
+            'machineFingerprint': (request.form.get('machineFingerprint') or '').strip(),
+        }
+
+    if not isinstance(data, dict) or not data:
         raise ValueError('Thiếu payload')
-    try:
-        plaintext = decrypt_aes_256_cbc(blob, _license_transport_key_bytes(), iv_b64=None)
-        data = json.loads(plaintext)
-    except Exception:
-        raise ValueError('Payload không hợp lệ')
-    ts = data.get('ts')
-    if ts is None:
-        raise ValueError('Thiếu ts')
-    try:
-        ts_int = int(ts)
-    except (TypeError, ValueError):
-        raise ValueError('ts không hợp lệ')
-    if abs(int(time.time()) - ts_int) > LICENSE_PAYLOAD_MAX_AGE_SEC:
-        raise ValueError('Payload hết hạn hoặc lệch giờ')
+
     return data
 
 
@@ -99,8 +105,7 @@ def activate_license():
     """
     Kích hoạt license và bind với machine.
 
-    Request: application/x-www-form-urlencoded, `_` = base64(iv||ciphertext AES-256-CBC).
-    Plaintext JSON: licenseKey, machineId, machineFingerprint, ts, n
+    Request: JSON/form thường: licenseKey, machineId, machineFingerprint
 
     Response:
     {
@@ -111,18 +116,18 @@ def activate_license():
     """
     try:
         try:
-            data = _parse_obfuscated_license_body()
+            data = _parse_license_request_body()
         except ValueError as e:
-            return jsonify({'success': False, 'error': str(e)}), 400
+            return _respond({'success': False, 'error': str(e)}, 400)
         license_key = data.get('licenseKey', '').strip()
         machine_id = data.get('machineId', '').strip()
         machine_fingerprint = data.get('machineFingerprint', '').strip()
 
         if not license_key:
-            return jsonify({'success': False, 'error': 'Thiếu license key'}), 400
+            return _respond({'success': False, 'error': 'Thiếu license key'}, 400)
 
         if not machine_id:
-            return jsonify({'success': False, 'error': 'Thiếu machine ID'}), 400
+            return _respond({'success': False, 'error': 'Thiếu machine ID'}, 400)
 
         conn = get_db()
         cur = conn.cursor()
@@ -139,23 +144,23 @@ def activate_license():
         if not license:
             cur.close()
             conn.close()
-            return jsonify({'success': False, 'error': 'License không tồn tại hoặc đã bị vô hiệu hóa'}), 401
+            return _respond({'success': False, 'error': 'License không tồn tại hoặc đã bị vô hiệu hóa'}, 401)
 
         # Check expiry (expires_at là datetime từ DB, không so sánh trực tiếp với float)
         if license['expires_at'] and license['expires_at'].timestamp() < time.time():
             cur.close()
             conn.close()
-            return jsonify({'success': False, 'error': 'License đã hết hạn'}), 401
+            return _respond({'success': False, 'error': 'License đã hết hạn'}, 401)
 
         # Check if already bound to different machine
         if license['machine_id'] and license['machine_id'] != machine_id:
             cur.close()
             conn.close()
-            return jsonify({
+            return _respond({
                 'success': False,
                 'error': 'License đã được kích hoạt trên máy khác',
                 'currentMachine': license['machine_id']
-            }), 403
+            }, 403)
 
         # Bind machine
         cur.execute("""
@@ -177,16 +182,18 @@ def activate_license():
         conn.close()
 
         shown = (license.get('display_title') or '').strip() or license.get('product_name')
-        return jsonify({
+        return _respond({
             'success': True,
             'productId': license['product_id'],
             'productName': shown,
             'expiresAt': expires_at_iso,
             'daysRemaining': days_remaining,
-        })
+            'serverTime': int(time.time()),
+            'nonce': secrets.token_hex(8),
+        }, 200)
 
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return _respond({'success': False, 'error': str(e)}, 500)
 
 
 # ============================================================================
@@ -198,7 +205,7 @@ def check_license():
     """
     Kiểm tra trạng thái license.
 
-    Request: cùng định dạng form `_` như /activate.
+    Request: cùng định dạng JSON/form thường như /activate.
 
     Response:
     {
@@ -211,15 +218,17 @@ def check_license():
     """
     try:
         try:
-            data = _parse_obfuscated_license_body()
+            data = _parse_license_request_body()
         except ValueError as e:
-            return jsonify({'valid': False, 'error': str(e)}), 400
-        license_key = data.get('licenseKey', '').strip()
-        machine_id = data.get('machineId', '').strip()
-        machine_fingerprint = data.get('machineFingerprint', '').strip()
+            # App desktop có thể gọi check sớm khi chưa có key local.
+            # Trả 200 + valid=false để không spam log 400.
+            return _respond({'valid': False, 'error': str(e)}, 200)
+        license_key = (data.get('licenseKey') or '').strip()
+        machine_id = (data.get('machineId') or '').strip()
+        machine_fingerprint = (data.get('machineFingerprint') or '').strip()
 
         if not license_key:
-            return jsonify({'error': 'Thiếu license key'}), 400
+            return _respond({'valid': False, 'error': 'Thiếu license key'}, 200)
 
         conn = get_db()
         cur = conn.cursor()
@@ -236,13 +245,13 @@ def check_license():
         if not license:
             cur.close()
             conn.close()
-            return jsonify({'valid': False, 'error': 'License không tồn tại'}), 401
+            return _respond({'valid': False, 'error': 'License không tồn tại'}, 401)
 
         # Verify machine binding
         if license['machine_id'] and license['machine_id'] != machine_id:
             cur.close()
             conn.close()
-            return jsonify({'valid': False, 'error': 'License đã bind với máy khác'}), 403
+            return _respond({'valid': False, 'error': 'License đã bind với máy khác'}, 403)
 
         # Check expiry
         valid = True
@@ -264,7 +273,7 @@ def check_license():
         conn.close()
 
         shown = (license.get('display_title') or '').strip() or license.get('product_name')
-        return jsonify({
+        return _respond({
             'valid': valid,
             'productId': license['product_id'],
             'productName': shown,
@@ -272,10 +281,11 @@ def check_license():
             'expiresAt': expires_at_iso,
             'daysRemaining': days_remaining,
             'serverTime': int(time.time()),
-        })
+            'nonce': secrets.token_hex(8),
+        }, 200)
 
     except Exception as e:
-        return jsonify({'valid': False, 'error': str(e)}), 500
+        return _respond({'valid': False, 'error': str(e)}, 500)
 
 
 # ============================================================================

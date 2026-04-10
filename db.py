@@ -10,18 +10,41 @@ import bcrypt
 
 def get_admin_seed_password() -> str:
     """Mật khẩu seed cho adminDongstore; ghi đè bằng biến môi trường ADMIN_SEED_PASSWORD."""
-    return os.environ.get("ADMIN_SEED_PASSWORD", "zxjkfhcjkshdioye897(*^&(*&*()@YHoghIH")
+    return os.environ.get("ADMIN_SEED_PASSWORD", "")
+
+
+def _env_or_file(name: str) -> str:
+    """Giá trị từ biến môi trường hoặc từ file {name}_FILE=/path (một dòng, không xuống dòng)."""
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        return raw
+    path = (os.environ.get(f"{name}_FILE") or "").strip()
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return ""
 
 
 def _pg_dsn() -> str:
-    url = os.environ.get("DATABASE_URL", "").strip()
+    url = _env_or_file("DATABASE_URL")
     if url:
         return url
     host = os.environ.get("PG_HOST", "localhost")
     port = os.environ.get("PG_PORT", "5432")
     db = os.environ.get("PG_DATABASE", "dong_store")
-    user = os.environ.get("PG_USER", "Dong_store")
-    password = os.environ.get("PG_PASSWORD", "fMBsnrH8jLjpFnXs")
+    user = os.environ.get("PG_USER", "dong_store")
+    password = _env_or_file("PG_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "PostgreSQL: thiếu mật khẩu. Trên VPS hãy set một trong hai:\n"
+            "  • DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DBNAME (khuyến nghị), hoặc\n"
+            "  • PG_PASSWORD=... (kèm PG_HOST, PG_PORT, PG_DATABASE, PG_USER nếu khác mặc định).\n"
+            "Có thể dùng PG_PASSWORD_FILE=/đường/dẫn/file (một dòng password).\n"
+            "Thêm vào .env cạnh app.py hoặc EnvironmentFile= / Environment= trong systemd."
+        )
     return f"host={host} port={port} dbname={db} user={user} password={password}"
 
 
@@ -89,6 +112,7 @@ def init_db():
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS require_duration INTEGER DEFAULT 0",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS app_download_url TEXT",
         "ALTER TABLE products ADD COLUMN IF NOT EXISTS app_installer_path TEXT",
+        "ALTER TABLE products ADD COLUMN IF NOT EXISTS require_first_deposit INTEGER DEFAULT 0",
     ]:
         cur.execute(col_sql)
 
@@ -119,6 +143,9 @@ def init_db():
             product_id TEXT NOT NULL REFERENCES products(id),
             product_snapshot TEXT,
             total_price INTEGER NOT NULL,
+            discount_code TEXT,
+            discount_amount INTEGER,
+            discount_counted INTEGER DEFAULT 0,
             status TEXT DEFAULT 'pending',
             payment_method TEXT,
             payment_id TEXT,
@@ -128,16 +155,58 @@ def init_db():
         )
         """
     )
+    # Bổ sung cột giảm giá cho orders nếu DB cũ chưa có
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code TEXT")
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_counted INTEGER DEFAULT 0")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL REFERENCES users(id),
             token_hash TEXT NOT NULL,
+            device_id TEXT,
+            revoked_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
         """
+    )
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS device_id TEXT")
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_device ON sessions(user_id, device_id)")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oauth_tickets (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_oauth_tickets_exp ON oauth_tickets(expires_at)")
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_audit_log (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            message TEXT,
+            ip TEXT,
+            user_agent TEXT,
+            user_id TEXT REFERENCES users(id),
+            extra TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_security_audit_created ON security_audit_log(created_at DESC)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_security_audit_type ON security_audit_log(event_type)"
     )
 
     # Wallets - mỗi user có 1 ví
@@ -275,6 +344,28 @@ def init_db():
         )
 
     conn.commit()
+    # Bảng mã giảm giá
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discount_codes (
+            code TEXT PRIMARY KEY,
+            discount_type TEXT NOT NULL, -- 'PERCENT' hoặc 'FIXED'
+            value INTEGER NOT NULL,
+            max_uses INTEGER,
+            used_count INTEGER DEFAULT 0,
+            min_order_amount INTEGER DEFAULT 0,
+            product_id TEXT REFERENCES products(id),
+            valid_from TIMESTAMPTZ,
+            valid_to TIMESTAMPTZ,
+            status TEXT DEFAULT 'ACTIVE',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute("ALTER TABLE discount_codes ADD COLUMN IF NOT EXISTS product_id TEXT REFERENCES products(id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_discount_codes_status ON discount_codes(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_discount_codes_valid ON discount_codes(valid_from, valid_to)")
 
     cur.execute("SELECT COUNT(*) AS c FROM products")
     row = cur.fetchone()
@@ -287,12 +378,15 @@ def init_db():
     cur.execute("SELECT id FROM users WHERE LOWER(email) = %s", ("admindongstore",))
     if not cur.fetchone():
         seed = get_admin_seed_password()
-        password_hash = bcrypt.hashpw(seed.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        cur.execute(
-            "INSERT INTO users (id, email, password, name, role) VALUES (%s, %s, %s, %s, %s)",
-            (str(uuid.uuid4()), "adminDongstore", password_hash, "Quản trị viên", "admin"),
-        )
-        print("✅ Default admin account: adminDongstore / (ADMIN_SEED_PASSWORD hoặc mặc định trong get_admin_seed_password)")
+        if seed:
+            password_hash = bcrypt.hashpw(seed.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            cur.execute(
+                "INSERT INTO users (id, email, password, name, role) VALUES (%s, %s, %s, %s, %s)",
+                (str(uuid.uuid4()), "adminDongstore", password_hash, "Quản trị viên", "admin"),
+            )
+            print("✅ Default admin account: adminDongstore / ADMIN_SEED_PASSWORD")
+        else:
+            print("⚠️  ADMIN_SEED_PASSWORD is not set, skip default admin seeding")
 
     # Đồng bộ âm thanh có giá → products (checkout dùng cùng id)
     try:

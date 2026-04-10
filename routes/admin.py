@@ -12,6 +12,8 @@ from auth import require_auth
 import upload
 import onedrive_graph
 from routes.orders import is_sound_product, generate_license_key as gen_order_license_key
+from routes.discounts import mark_discount_used_for_order
+from datetime import datetime, timezone
 
 admin_bp = Blueprint('admin', __name__)
 
@@ -52,6 +54,8 @@ def _require_admin(f):
     @wraps(f)
     @require_auth
     def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return ('', 204)
         # request.user là dict (auth.require_auth), không phải object — getattr(..., 'role') luôn None → 403 sai
         if request.user.get('role') != 'admin':
             return jsonify({'error': 'Admin only'}), 403
@@ -137,6 +141,7 @@ def create_product():
         except Exception:
             continue
     require_duration = 1 if data.get('require_duration', False) else 0
+    require_first_deposit = 1 if data.get('require_first_deposit', False) else 0
     app_download_url = data.get('appDownloadUrl') or data.get('app_download_url') or ''
     if isinstance(app_download_url, str):
         app_download_url = app_download_url.strip() or None
@@ -153,8 +158,8 @@ def create_product():
     try:
         cur.execute(
             """
-            INSERT INTO products (id, name, category, price, original_price, badge, emoji, description, features, image, video_url, stock, is_active, content, images, install_guide, screenshots, preview_audio, duration_options, duration_prices, require_duration, app_download_url, app_installer_path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO products (id, name, category, price, original_price, badge, emoji, description, features, image, video_url, stock, is_active, content, images, install_guide, screenshots, preview_audio, duration_options, duration_prices, require_duration, app_download_url, app_installer_path, require_first_deposit)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 product_id,
@@ -180,6 +185,7 @@ def create_product():
                 require_duration,
                 app_download_url,
                 None,
+                require_first_deposit,
             ),
         )
         conn.commit()
@@ -225,6 +231,7 @@ def get_product(product_id):
     except Exception:
         p['duration_prices'] = {}
     p['require_duration'] = bool(p.get('require_duration'))
+    p['require_first_deposit'] = bool(p.get('require_first_deposit'))
     return jsonify(p)
 
 
@@ -243,7 +250,7 @@ def update_product(product_id):
     updates = []
     params = []
 
-    for field in ['name', 'category', 'price', 'original_price', 'badge', 'emoji', 'description', 'image', 'video_url', 'stock', 'is_active', 'content', 'images', 'screenshots', 'features', 'preview_audio', 'duration_options', 'duration_prices', 'require_duration']:
+    for field in ['name', 'category', 'price', 'original_price', 'badge', 'emoji', 'description', 'image', 'video_url', 'stock', 'is_active', 'content', 'images', 'screenshots', 'features', 'preview_audio', 'duration_options', 'duration_prices', 'require_duration', 'require_first_deposit']:
         if field in data:
             val = data[field]
             if field in ('price', 'original_price', 'stock'):
@@ -264,7 +271,7 @@ def update_product(product_id):
                     val = json.dumps(normalized_prices, ensure_ascii=False)
                 else:
                     val = json.dumps({}, ensure_ascii=False)
-            elif field == 'require_duration':
+            elif field in ('require_duration', 'require_first_deposit'):
                 val = 1 if val else 0
             elif field == 'install_guide':
                 continue
@@ -417,6 +424,8 @@ def update_order_status(order_id):
                 (new_status, order_id),
             )
             conn.commit()
+            if new_status in ('completed', 'paid'):
+                mark_discount_used_for_order(order_id)
             return jsonify({'success': True, 'id': order_id, 'status': new_status, 'licenseKey': None, 'isSoundOrder': True})
 
         # Nếu là đơn gia hạn (snapshot có renew_key) thì dùng lại key cũ và cộng dồn thời hạn
@@ -460,6 +469,8 @@ def update_order_status(order_id):
                 (new_status, renew_key, order_id)
             )
             conn.commit()
+            if new_status in ('completed', 'paid'):
+                mark_discount_used_for_order(order_id)
             return jsonify({'success': True, 'id': order_id, 'status': new_status, 'licenseKey': renew_key})
 
         license_key = gen_order_license_key(order_row['product_id'])
@@ -468,6 +479,8 @@ def update_order_status(order_id):
             (new_status, license_key, order_id)
         )
         conn.commit()
+        if new_status in ('completed', 'paid'):
+            mark_discount_used_for_order(order_id)
         return jsonify({'success': True, 'id': order_id, 'status': new_status, 'licenseKey': license_key})
     else:
         cur.execute(
@@ -475,6 +488,8 @@ def update_order_status(order_id):
             (new_status, order_id)
         )
         conn.commit()
+        if new_status in ('completed', 'paid'):
+            mark_discount_used_for_order(order_id)
         return jsonify({'success': True, 'id': order_id, 'status': new_status})
 
 
@@ -492,6 +507,66 @@ def list_users_admin():
         if u.get('created_at'):
             u['createdAt'] = u['created_at'].isoformat() if hasattr(u['created_at'], 'isoformat') else str(u['created_at'])
     return jsonify({'users': users})
+
+
+@admin_bp.route('/users/<user_id>/sessions', methods=['GET'])
+@_require_admin
+def list_user_sessions_admin(user_id: str):
+    """
+    Danh sách session theo thiết bị của 1 user để theo dõi trên trang admin.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, token_hash, device_id, expires_at, created_at, revoked_at
+        FROM sessions
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        """,
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    sessions = []
+    for r in rows:
+        item = dict(r)
+        for k in ("expires_at", "created_at", "revoked_at"):
+            v = item.get(k)
+            if v is not None and hasattr(v, "isoformat"):
+                item[k] = v.isoformat()
+        sessions.append(item)
+    return jsonify({"sessions": sessions})
+
+
+@admin_bp.route('/users/<user_id>/sessions/revoke-device', methods=['POST'])
+@_require_admin
+def revoke_user_device_sessions_admin(user_id: str):
+    """
+    Thu hồi toàn bộ session của user theo deviceId.
+    """
+    data = request.get_json(silent=True) or {}
+    device_id = (data.get("deviceId") or "").strip()
+    if not device_id:
+        return jsonify({"error": "deviceId là bắt buộc"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE sessions
+        SET revoked_at = NOW()
+        WHERE user_id = %s AND device_id = %s AND revoked_at IS NULL
+        """,
+        (user_id, device_id),
+    )
+    affected = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"success": True, "revoked": affected, "userId": user_id, "deviceId": device_id})
 
 
 @admin_bp.route('/stats/dashboard', methods=['GET'])
@@ -1254,20 +1329,49 @@ def adjust_wallet_balance(user_id):
     conn = get_db()
     cur = conn.cursor()
 
-    # Đảm bảo ví tồn tại
-    cur.execute('SELECT id FROM wallets WHERE user_id = %s', (user_id,))
+    # Đảm bảo ví tồn tại và lấy balance hiện tại để tính chênh lệch.
+    cur.execute('SELECT id, balance FROM wallets WHERE user_id = %s', (user_id,))
     wallet = cur.fetchone()
+
+    current_balance = int(wallet.get('balance') or 0) if wallet else 0
+    delta = int(new_balance) - current_balance
+
     if not wallet:
         wallet_id = str(uuid.uuid4())
         cur.execute(
             'INSERT INTO wallets (id, user_id, balance) VALUES (%s, %s, %s)',
-            (wallet_id, user_id, new_balance)
+            (wallet_id, user_id, new_balance),
         )
     else:
         wallet_id = wallet['id']
         cur.execute(
             'UPDATE wallets SET balance = %s, updated_at = NOW() WHERE id = %s',
             (new_balance, wallet_id)
+        )
+
+    # Nếu admin "cộng tiền" (tăng balance), tạo một bản ghi deposits để
+    # các sản phẩm require_first_deposit có thể check "đã phát sinh giao dịch nạp".
+    if delta > 0:
+        deposit_id = f"ADJ{uuid.uuid4().hex[:10].upper()}"
+        transfer_content = note or f"ADMIN_ADJUST_{deposit_id}"
+        cur.execute(
+            """
+            INSERT INTO deposits (id, user_id, amount, transfer_content,
+                                   bank_name, account_number, account_name, qr_url,
+                                   status, confirmed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                deposit_id,
+                user_id,
+                delta,
+                transfer_content,
+                'admin',
+                None,
+                None,
+                None,
+                'completed',
+            ),
         )
 
     conn.commit()
@@ -1280,6 +1384,310 @@ def adjust_wallet_balance(user_id):
         'newBalance': new_balance,
         'note': note,
     })
+
+
+# ─── Security audit log ───────────────────────────────────────────────────────
+
+
+@admin_bp.route('/security-audit', methods=['GET'])
+@_require_admin
+def list_security_audit():
+    """Nhật ký bảo mật (đăng nhập sai, callback, admin key, …)."""
+    limit = min(request.args.get('limit', 50, type=int), 200)
+    page = max(request.args.get('page', 1, type=int), 1)
+    offset = (page - 1) * limit
+    event_type = (request.args.get('event_type') or '').strip()
+
+    conn = get_db()
+    cur = conn.cursor()
+    where = ''
+    params = []
+    if event_type:
+        where = 'WHERE event_type = %s'
+        params.append(event_type)
+
+    cur.execute(
+        f'SELECT COUNT(*) AS c FROM security_audit_log {where}',
+        params,
+    )
+    total_row = cur.fetchone()
+    total = int((total_row or {}).get('c') or 0)
+
+    cur.execute(
+        f"""
+        SELECT id, event_type, message, ip, user_agent, user_id, extra, created_at
+        FROM security_audit_log
+        {where}
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        params + [limit, offset],
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        if d.get('created_at') and hasattr(d['created_at'], 'isoformat'):
+            d['created_at'] = d['created_at'].isoformat()
+        items.append(d)
+
+    return jsonify({
+        'items': items,
+        'pagination': {
+            'page': page,
+            'limit': limit,
+            'total': total,
+            'totalPages': (total + limit - 1) // limit if limit else 0,
+        },
+    })
+
+
+# ─── Discount Codes (mã giảm giá) ───────────────────────────────────────────────
+
+
+@admin_bp.route('/discounts', methods=['GET'])
+@_require_admin
+def list_discounts():
+    """Danh sách mã giảm giá."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT d.code,
+               d.discount_type,
+               d.value,
+               d.max_uses,
+               COALESCE(oc.used_count, 0) AS used_count,
+               d.min_order_amount,
+               d.product_id,
+               p.name AS product_name,
+               d.valid_from,
+               d.valid_to,
+               d.status,
+               d.created_at,
+               d.updated_at
+        FROM discount_codes d
+        LEFT JOIN (
+            SELECT discount_code AS code, COUNT(*) AS used_count
+            FROM orders
+            WHERE discount_code IS NOT NULL
+              AND status IN ('completed', 'paid')
+            GROUP BY discount_code
+        ) oc ON oc.code = d.code
+        LEFT JOIN products p ON d.product_id = p.id
+        ORDER BY d.created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    items = []
+    for r in rows:
+        d = dict(r)
+        for f in ('valid_from', 'valid_to', 'created_at', 'updated_at'):
+            if d.get(f) and hasattr(d[f], 'isoformat'):
+                d[f] = d[f].isoformat()
+        items.append(d)
+    return jsonify({'discounts': items})
+
+
+@admin_bp.route('/discounts', methods=['POST'])
+@_require_admin
+def create_discount():
+    """Tạo mã giảm giá mới."""
+    data = request.get_json(silent=True) or {}
+    code = (data.get('code') or '').strip().upper()
+    discount_type = (data.get('discount_type') or data.get('discountType') or 'PERCENT').strip().upper()
+    try:
+        value = int(data.get('value') or 0)
+    except Exception:
+        value = 0
+    max_uses = data.get('max_uses', data.get('maxUses'))
+    try:
+        max_uses_int = int(max_uses) if max_uses is not None else None
+    except Exception:
+        max_uses_int = None
+    try:
+        min_amount = int(data.get('min_order_amount') or data.get('minOrderAmount') or 0)
+    except Exception:
+        min_amount = 0
+    status = (data.get('status') or 'ACTIVE').strip().upper()
+    product_id = (data.get('product_id') or data.get('productId') or '').strip() or None
+    valid_from_raw = (data.get('valid_from') or data.get('validFrom') or '').strip()
+    valid_to_raw = (data.get('valid_to') or data.get('validTo') or '').strip()
+
+    if not code:
+        return jsonify({'error': 'code là bắt buộc'}), 400
+    if discount_type not in ('PERCENT', 'FIXED'):
+        return jsonify({'error': "discount_type phải là 'PERCENT' hoặc 'FIXED'"}), 400
+    if value <= 0:
+        return jsonify({'error': 'value phải > 0'}), 400
+
+    def _parse_dt(s):
+        if not s:
+            return None
+        try:
+            # Chấp nhận ISO hoặc yyyy-mm-dd
+            if 'T' in s:
+                return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(timezone.utc)
+            return datetime.strptime(s, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    valid_from = _parse_dt(valid_from_raw)
+    valid_to = _parse_dt(valid_to_raw)
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO discount_codes
+            (code, discount_type, value, max_uses, used_count, min_order_amount,
+             product_id, valid_from, valid_to, status, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 0, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (code) DO NOTHING
+            """,
+            (code, discount_type, value, max_uses_int, min_amount, product_id, valid_from, valid_to, status),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return jsonify({'error': 'Code đã tồn tại, dùng PUT để cập nhật'}), 400
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': f'Lỗi tạo mã: {e}'}), 400
+    finally:
+        cur.close()
+        conn.close()
+
+    return jsonify({'success': True, 'code': code}), 201
+
+
+@admin_bp.route('/discounts/<code>', methods=['PUT'])
+@_require_admin
+def update_discount(code):
+    """Cập nhật mã giảm giá (không reset used_count)."""
+    raw_code = (code or '').strip().upper()
+    data = request.get_json(silent=True) or {}
+
+    fields = []
+    params = []
+
+    if 'discount_type' in data or 'discountType' in data:
+        discount_type = (data.get('discount_type') or data.get('discountType') or '').strip().upper()
+        if discount_type not in ('PERCENT', 'FIXED'):
+            return jsonify({'error': "discount_type phải là 'PERCENT' hoặc 'FIXED'"}), 400
+        fields.append('discount_type = %s')
+        params.append(discount_type)
+
+    if 'value' in data:
+        try:
+          value = int(data.get('value') or 0)
+        except Exception:
+          value = 0
+        if value <= 0:
+            return jsonify({'error': 'value phải > 0'}), 400
+        fields.append('value = %s')
+        params.append(value)
+
+    if 'max_uses' in data or 'maxUses' in data:
+        mv = data.get('max_uses', data.get('maxUses'))
+        if mv in (None, '', 0, '0'):
+            fields.append('max_uses = NULL')
+        else:
+            try:
+                max_uses_int = int(mv)
+            except Exception:
+                return jsonify({'error': 'max_uses phải là số nguyên'}), 400
+            fields.append('max_uses = %s')
+            params.append(max_uses_int)
+
+    if 'min_order_amount' in data or 'minOrderAmount' in data:
+        try:
+            min_amount = int(data.get('min_order_amount') or data.get('minOrderAmount') or 0)
+        except Exception:
+            return jsonify({'error': 'min_order_amount phải là số nguyên'}), 400
+        fields.append('min_order_amount = %s')
+        params.append(min_amount)
+
+    if 'status' in data:
+        status = (data.get('status') or '').strip().upper()
+        if status not in ('ACTIVE', 'INACTIVE'):
+            return jsonify({'error': "status phải là 'ACTIVE' hoặc 'INACTIVE'"}), 400
+        fields.append('status = %s')
+        params.append(status)
+
+    def _parse_dt(s):
+        if not s:
+            return None
+        try:
+            if 'T' in s:
+                return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(timezone.utc)
+            return datetime.strptime(s, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    if 'valid_from' in data or 'validFrom' in data:
+        vraw = (data.get('valid_from') or data.get('validFrom') or '').strip()
+        vdt = _parse_dt(vraw)
+        fields.append('valid_from = %s')
+        params.append(vdt)
+
+    if 'valid_to' in data or 'validTo' in data:
+        vraw = (data.get('valid_to') or data.get('validTo') or '').strip()
+        vdt = _parse_dt(vraw)
+        fields.append('valid_to = %s')
+        params.append(vdt)
+
+    if not fields:
+        return jsonify({'error': 'Không có trường nào để cập nhật'}), 400
+
+    if 'product_id' in data or 'productId' in data:
+        pid = (data.get('product_id') or data.get('productId') or '').strip()
+        fields.append('product_id = %s')
+        params.append(pid or None)
+
+    fields.append('updated_at = NOW()')
+
+    conn = get_db()
+    cur = conn.cursor()
+    params.append(raw_code)
+    cur.execute(
+        f"UPDATE discount_codes SET {', '.join(fields)} WHERE code = %s",
+        params,
+    )
+    if cur.rowcount == 0:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Mã không tồn tại'}), 404
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@admin_bp.route('/discounts/<code>', methods=['DELETE'])
+@_require_admin
+def delete_discount(code):
+    """Xóa hẳn mã giảm giá."""
+    raw_code = (code or '').strip().upper()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM discount_codes WHERE code = %s', (raw_code,))
+    if cur.rowcount == 0:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Mã không tồn tại'}), 404
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({'success': True})
 
 
 def _build_latest_yml(version: str, installer_filename: str, size: int, sha512_b64: str) -> str:
@@ -1420,7 +1828,8 @@ def create_desktop_release():
         return jsonify({'error': 'Thiếu hoặc sai app_slug (vd. tiengcuoi-dong).'}), 400
     if not f or not f.filename:
         return jsonify({'error': 'Thiếu file cài đặt (.exe).'}), 400
-    if not version or not re.match(r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$', version):
+    # Accept SemVer with optional leading "v", prerelease, and build metadata.
+    if not version or not re.match(r'^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$', version):
         return jsonify({'error': 'version phải dạng semver (vd. 0.2.0).'}), 400
 
     conn = get_db()

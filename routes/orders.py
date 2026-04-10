@@ -6,8 +6,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from db import get_db
 from auth import require_auth
+from rate_limit import hit_rate, response_429
 from crypto import generate_license_secret, hash_license_secret
 import onedrive_graph
+from routes.discounts import apply_discount_if_any, mark_discount_used_for_order
 
 orders_bp = Blueprint('orders', __name__)
 
@@ -283,22 +285,41 @@ def create_pending_order():
     Tạo đơn hàng ở trạng thái pending, trả về thông tin thanh toán VietQR.
     Frontend hiển thị QR cho user chuyển khoản, sau đó polling /orders/<id>.
     """
+    # 30 req / 5 phút / user
+    if not hit_rate("order_pending", 30, 300, request.user["id"]):
+        return response_429(300)
     data = request.get_json() or {}
     product_id = data.get('productId')
     duration_code_input = data.get('duration')
     renew_key = (data.get('renewKey') or '').strip() or None
     display_title = normalize_license_display_title(data.get('displayTitle'))
+    discount_code_input = data.get('discountCode')
+    fixed_price_vnd = data.get('fixedPriceVnd')
+    try:
+        fixed_price_vnd = int(fixed_price_vnd) if fixed_price_vnd is not None else None
+    except Exception:
+        fixed_price_vnd = None
+    if fixed_price_vnd is not None and fixed_price_vnd <= 0:
+        fixed_price_vnd = None
 
     if not product_id:
         return jsonify({'error': 'productId là bắt buộc'}), 400
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('SELECT * FROM products WHERE id = %s AND is_active = 1', (product_id,))
+    # Cho phép tạo order cả khi product chưa bật is_active (app desktop có thể dùng product seed nội bộ).
+    cur.execute('SELECT * FROM products WHERE id = %s', (product_id,))
     product = cur.fetchone()
 
     if not product:
         return jsonify({'error': 'Sản phẩm không tồn tại'}), 404
+
+    # Sản phẩm tải miễn phí sau khi nạp tiền: không tạo order / không tạo key.
+    # (Frontend sẽ dùng endpoint `/products/<id>/free-download`.)
+    if bool(product.get('require_first_deposit')):
+        return jsonify({
+            'error': 'Sản phẩm này chỉ hỗ trợ tải miễn phí sau khi nạp tiền; không tạo đơn/không cần key.'
+        }), 400
 
     if renew_key and is_sound_product(product):
         return jsonify({'error': 'Âm thanh không hỗ trợ gia hạn key'}), 400
@@ -309,6 +330,7 @@ def create_pending_order():
     if is_sound_product(product):
         duration_code, duration_label = None, None
         selected_price = int(product['price'])
+        base_price = int(product['price'])
         snapshot = {
             'name': product['name'],
             'emoji': product.get('emoji'),
@@ -317,7 +339,7 @@ def create_pending_order():
             'duration_label': None,
             'allowed_duration_codes': [],
             'duration_prices': {},
-            'selected_price': selected_price,
+            'selected_price': base_price,
             'renew_key': None,
             'require_duration': False,
             'is_sound': True,
@@ -372,14 +394,30 @@ def create_pending_order():
         if display_title:
             snapshot['display_title'] = display_title
 
+    base_total = selected_price
+    if fixed_price_vnd is not None:
+        # Ép giá cố định để app/desktop thu đúng số tiền.
+        selected_price = fixed_price_vnd
+        snapshot['selected_price'] = fixed_price_vnd
+        base_total = fixed_price_vnd
+        final_total = fixed_price_vnd
+        applied_code = None
+        discount_amount = 0
+    else:
+        final_total, applied_code, discount_amount, discount_error = apply_discount_if_any(
+            discount_code_input, base_total, product_id, user_id=request.user['id']
+        )
+        if discount_error:
+            return jsonify({'error': discount_error}), 400
+
     cur.execute("""
-        INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, status, payment_method, license_key)
-        VALUES (%s, %s, %s, %s, %s, 'pending', 'vietqr', NULL)
+        INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, discount_code, discount_amount, status, payment_method, license_key)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', 'vietqr', NULL)
     """, (order_id, request.user['id'], product_id, json.dumps(snapshot),
-          selected_price))
+          final_total, applied_code, discount_amount))
     conn.commit()
 
-    pay = _payment_ui_for_order(order_id, selected_price)
+    pay = _payment_ui_for_order(order_id, final_total)
 
     return jsonify({
         'id': order_id,
@@ -531,6 +569,87 @@ def get_order(order_id):
     return jsonify(payload)
 
 
+@orders_bp.route('/<order_id>/apply-discount', methods=['POST'])
+@require_auth
+def apply_discount(order_id):
+    """
+    Áp dụng / thay đổi mã giảm giá cho đơn pending hiện tại.
+    Cập nhật lại total_price, discount_code, discount_amount và thông tin VietQR.
+    """
+    if not hit_rate("order_apply_discount", 40, 60, request.user["id"]):
+        return response_429(60)
+    _expire_check()
+    data = request.get_json() or {}
+    raw_code = data.get('code') or data.get('discountCode') or ''
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, status, total_price, COALESCE(discount_amount, 0) AS discount_amount, product_id
+        FROM orders
+        WHERE id = %s AND user_id = %s
+        """,
+        (order_id, request.user['id']),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Đơn hàng không tồn tại'}), 404
+    if str(row.get('status') or '') != 'pending':
+        cur.close()
+        conn.close()
+        return jsonify({'error': 'Chỉ áp dụng mã cho đơn đang chờ thanh toán'}), 400
+
+    current_total = int(row.get('total_price') or 0)
+    current_discount = int(row.get('discount_amount') or 0)
+    base_total = current_total + max(current_discount, 0)
+
+    final_total, applied_code, discount_amount, discount_error = apply_discount_if_any(
+        raw_code,
+        base_total,
+        row.get('product_id'),
+        user_id=request.user['id'],
+        exclude_order_id=order_id,
+    )
+    if discount_error:
+        cur.close()
+        conn.close()
+        return jsonify({'error': discount_error}), 400
+
+    cur.execute(
+        """
+        UPDATE orders
+        SET total_price = %s,
+            discount_code = %s,
+            discount_amount = %s,
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (final_total, applied_code, discount_amount, order_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    pay = _payment_ui_for_order(order_id, final_total)
+    return jsonify(
+        {
+            'id': order_id,
+            'status': 'pending',
+            'transferContent': pay['transferContent'],
+            'totalPrice': pay['totalPrice'],
+            'bankName': pay['bankName'],
+            'accountNumber': pay['accountNumber'],
+            'accountName': pay['accountName'],
+            'qrUrl': pay['qrUrl'],
+            'discountCode': applied_code,
+            'discountAmount': discount_amount,
+        }
+    )
+
+
 @orders_bp.route('/<order_id>/app-installer', methods=['GET'])
 @require_auth
 def get_order_app_installer(order_id):
@@ -642,6 +761,7 @@ def create_order():
     payment_method = data.get('paymentMethod', 'banking')
     duration_code_input = data.get('duration')
     display_title = normalize_license_display_title(data.get('displayTitle'))
+    discount_code_input = data.get('discountCode')
 
     if not product_id:
         return jsonify({'error': 'productId là bắt buộc'}), 400
@@ -653,6 +773,12 @@ def create_order():
 
     if not product:
         return jsonify({'error': 'Sản phẩm không tồn tại'}), 404
+
+    # Sản phẩm tải miễn phí sau khi nạp tiền: không tạo order / không tạo key.
+    if bool(product.get('require_first_deposit')):
+        return jsonify({
+            'error': 'Sản phẩm này chỉ hỗ trợ tải miễn phí sau khi nạp tiền; không tạo đơn/không cần key.'
+        }), 400
 
     order_id = f"DH{str(uuid.uuid4().hex[:10]).upper()}"
 
@@ -670,12 +796,19 @@ def create_order():
             'require_duration': False,
             'is_sound': True,
         }
+        base_total = selected_price
+        final_total, applied_code, discount_amount, discount_error = apply_discount_if_any(
+            discount_code_input, base_total, product_id, user_id=request.user['id']
+        )
+        if discount_error:
+            return jsonify({'error': discount_error}), 400
         cur.execute("""
-            INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, status, payment_method, license_key)
-            VALUES (%s, %s, %s, %s, %s, 'completed', %s, NULL)
+            INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, discount_code, discount_amount, status, payment_method, license_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed', %s, NULL)
         """, (order_id, request.user['id'], product_id, json.dumps(snapshot),
-              selected_price, payment_method))
+              final_total, applied_code, discount_amount, payment_method))
         conn.commit()
+        mark_discount_used_for_order(order_id)
         cur.close()
         conn.close()
         return jsonify({
@@ -685,7 +818,7 @@ def create_order():
                 'emoji': snapshot['emoji'],
                 'category': snapshot['category'],
                 'date': None,
-                'price': selected_price,
+                'price': final_total,
                 'status': 'completed',
                 'key': None,
             },
@@ -726,11 +859,18 @@ def create_order():
     if display_title:
         snapshot['display_title'] = display_title
 
+    base_total = selected_price
+    final_total, applied_code, discount_amount, discount_error = apply_discount_if_any(
+        discount_code_input, base_total, product_id, user_id=request.user['id']
+    )
+    if discount_error:
+        return jsonify({'error': discount_error}), 400
+
     cur.execute("""
-        INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, status, payment_method, license_key)
-        VALUES (%s, %s, %s, %s, %s, 'completed', %s, %s)
+        INSERT INTO orders (id, user_id, product_id, product_snapshot, total_price, discount_code, discount_amount, status, payment_method, license_key)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'completed', %s, %s)
     """, (order_id, request.user['id'], product_id, json.dumps(snapshot),
-          selected_price, payment_method, license_key))
+          final_total, applied_code, discount_amount, payment_method, license_key))
 
     # Tạo license record với secret
     _, license_secret = _create_license_record(
@@ -738,6 +878,7 @@ def create_order():
     )
 
     conn.commit()
+    mark_discount_used_for_order(order_id)
 
     return jsonify({
         'order': {
@@ -746,7 +887,7 @@ def create_order():
             'emoji': snapshot['emoji'],
             'category': snapshot['category'],
             'date': None,
-            'price': selected_price,
+            'price': final_total,
             'status': 'completed',
             'key': license_key,
         },

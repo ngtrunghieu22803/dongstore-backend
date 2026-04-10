@@ -4,11 +4,32 @@ from dotenv import load_dotenv
 from os import environ
 from pathlib import Path
 
-# Load .env
-env_path = Path(__file__).resolve().parent / ".env"
-if env_path.exists():
-    # Ưu tiên giá trị trong file .env của project, tránh bị biến môi trường hệ thống ghi đè
-    load_dotenv(env_path, override=True)
+_APP_ROOT = Path(__file__).resolve().parent
+
+
+def _secret_from_env(name: str) -> str:
+    """Đọc biến môi trường hoặc nội dung file nếu có {name}_FILE=/path (Docker/panel)."""
+    raw = (environ.get(name) or "").strip()
+    if raw:
+        return raw
+    path = (environ.get(f"{name}_FILE") or "").strip()
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        if p.is_file():
+            return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+# Load .env: mặc định file cạnh app.py; DOTENV_PATH (file thứ hai) ghi đè nếu có
+if (_APP_ROOT / ".env").is_file():
+    load_dotenv(_APP_ROOT / ".env", override=True)
+_dotenv_extra = (environ.get("DOTENV_PATH") or "").strip()
+if _dotenv_extra and Path(_dotenv_extra).is_file():
+    load_dotenv(Path(_dotenv_extra), override=True)
 
 from db import init_db
 from routes.auth_routes import auth_bp
@@ -22,12 +43,14 @@ from routes.license import license_bp
 from routes.validate import validate_bp
 from routes.me import me_bp
 from routes.desktop_public import desktop_public_bp, desktop_legacy_bp
+from routes.discounts import discounts_bp
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-app.config['JWT_SECRET'] = environ.get('JWT_SECRET', environ.get('SECRET_KEY', 'dev-jwt-key'))
+app.config['SECRET_KEY'] = _secret_from_env('SECRET_KEY')
+app.config['JWT_SECRET'] = _secret_from_env('JWT_SECRET')
 # Secure API key cho mã hóa 2 chiều (Electron <-> Backend)
-app.config['SECURE_API_KEY'] = environ.get('SECURE_API_KEY', 'secure-api-key-change-in-production-32chars')
+app.config['SECURE_API_KEY'] = _secret_from_env('SECURE_API_KEY')
+app.config['PAYMENTS_CALLBACK_SECRET'] = environ.get('PAYMENTS_CALLBACK_SECRET', '').strip()
 
 # Google OAuth config
 app.config['GOOGLE_CLIENT_ID'] = environ.get('GOOGLE_CLIENT_ID', '')
@@ -81,6 +104,30 @@ app.config['ONEDRIVE_APP_INSTALLER_FOLDER'] = environ.get(
     'ONEDRIVE_APP_INSTALLER_FOLDER', 'DongStore_sounds/phanmem'
 ).strip().strip('/')
 app.config['API_BASE_URL'] = environ.get('API_BASE_URL', '').rstrip('/')
+
+
+def _must_set(name: str):
+    val = (app.config.get(name) or '').strip()
+    if not val:
+        hints = {
+            'SECRET_KEY': 'Thêm vào .env hoặc systemd: SECRET_KEY=<chuỗi ngẫu nhiên dài ≥32 ký tự>',
+            'JWT_SECRET': 'Thêm vào .env hoặc systemd: JWT_SECRET=<chuỗi ngẫu nhiên khác SECRET_KEY>',
+            'SECURE_API_KEY': (
+                f"Bắt buộc cho /api/secure/*. Thêm vào {_APP_ROOT / '.env'} dòng SECURE_API_KEY=... "
+                "hoặc systemd Environment=SECURE_API_KEY=... hoặc file chứa khóa + "
+                "Environment=SECURE_API_KEY_FILE=/đường/dẫn/file. Tạo khóa: "
+                'python3 -c "import secrets; print(secrets.token_urlsafe(40))". '
+                "Nếu dùng file .env khác vị trí: export DOTENV_PATH=/full/path/.env trước khi chạy."
+            ),
+        }
+        extra = f" {hints[name]}" if name in hints else ''
+        raise RuntimeError(f'Missing required secret: {name}.{extra}')
+    return val
+
+
+_must_set('SECRET_KEY')
+_must_set('JWT_SECRET')
+_must_set('SECURE_API_KEY')
 
 # CORS: nếu chỉ set FRONTEND_URL trong .env mà KHÔNG set CORS_ORIGINS, trước đây chỉ cho phép
 # đúng 1 origin (vd. 5173) → Vite chạy 5177 sẽ bị Failed to fetch. Giờ luôn gộp default + FRONTEND_URL.
@@ -171,6 +218,7 @@ app.register_blueprint(validate_bp, url_prefix='/api')
 app.register_blueprint(me_bp, url_prefix='/api/me')
 app.register_blueprint(desktop_public_bp, url_prefix='/api/desktop-updates')
 app.register_blueprint(desktop_legacy_bp, url_prefix='/api/app-desktop')
+app.register_blueprint(discounts_bp, url_prefix='/api/discounts')
 
 
 @app.route('/api/health', methods=['GET'])

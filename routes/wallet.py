@@ -11,6 +11,7 @@ from db import get_db
 from auth import require_auth
 from crypto import hash_license_secret
 from routes.orders import normalize_license_display_title, is_sound_product
+from rate_limit import hit_rate, response_429
 
 wallet_bp = Blueprint('wallet', __name__)
 
@@ -372,6 +373,8 @@ def get_balance():
 @wallet_bp.route('/deposit', methods=['POST'])
 @require_auth
 def create_deposit():
+    if not hit_rate("wallet_deposit", 15, 300, request.user["id"]):
+        return response_429(300)
     _cancel_expired_deposits()
     _reload_thueapibank_config()
     data = request.get_json() or {}
@@ -461,6 +464,8 @@ def get_deposit(deposit_id):
 @require_auth
 def confirm_deposit(deposit_id):
     """User xác nhận đã chuyển khoản → tự động kiểm tra qua thueapibank.vn."""
+    if not hit_rate("wallet_deposit_confirm", 25, 300, request.user["id"]):
+        return response_429(300)
     _reload_thueapibank_config()
     user_id = request.user['id']
     conn = get_db()
@@ -522,6 +527,8 @@ def confirm_deposit(deposit_id):
 @require_auth
 def check_deposit(deposit_id):
     """Endpoint riêng để kiểm tra giao dịch qua thueapibank (gọi thủ công)."""
+    if not hit_rate("wallet_deposit_check", 40, 60, request.user["id"]):
+        return response_429(60)
     _reload_thueapibank_config()
     user_id = request.user['id']
     conn = get_db()
@@ -643,6 +650,8 @@ def get_deposits():
 @wallet_bp.route('/pay', methods=['POST'])
 @require_auth
 def pay_with_wallet():
+    if not hit_rate("wallet_pay", 20, 300, request.user["id"]):
+        return response_429(300)
     data = request.get_json() or {}
     order_id = data.get('orderId')
 
@@ -694,6 +703,13 @@ def pay_with_wallet():
 
     cur.execute('SELECT * FROM products WHERE id = %s', (order['product_id'],))
     product_row = cur.fetchone()
+
+    # Sản phẩm tải miễn phí sau khi nạp tiền: không cho thanh toán để tạo key.
+    # Giữ backend nhất quán với frontend (button đổi sang “Tải”, không sinh license_key).
+    if product_row and bool(product_row.get('require_first_deposit')):
+        return jsonify({
+            'error': 'Sản phẩm này chỉ hỗ trợ tải miễn phí sau khi nạp tiền; không thanh toán để tạo key.'
+        }), 400
 
     if renew_key:
         cur.execute('SELECT require_duration FROM products WHERE id = %s', (order['product_id'],))
